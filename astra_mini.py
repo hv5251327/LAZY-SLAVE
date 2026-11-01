@@ -118,7 +118,7 @@ except Exception as _e:
 import ctypes.wintypes as wintypes
 
 EnumWindows = _user32.EnumWindows
-EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.POINTER(ctypes.c_int))
+EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 GetWindowText = _user32.GetWindowTextW
 GetWindowTextLength = _user32.GetWindowTextLengthW
 IsWindowVisible = _user32.IsWindowVisible
@@ -482,53 +482,101 @@ def press_vk(vk, times=1, delay=0.08):
 
 
 # ---- Mouse movement (relative) --------------------------------------------
-def move_mouse(direction, amount=200):
-    """Move cursor by N pixels in a direction."""
-    try:
-        from ctypes import wintypes
-        amount = int(amount)
-    except Exception:
-        amount = 200
+_DIR_H = {"right": 1, "left": -1, "east": 1, "west": -1}
+_DIR_V = {"down": 1, "up": -1, "south": 1, "north": -1}
+_MAG = [("a little", 60), ("little", 80), ("bit", 80), ("slightly", 80),
+        ("small", 80), ("half", 100), ("quarter", 50), ("medium", 100),
+        ("a lot", 500), ("lot", 400), ("much", 400), ("far", 500),
+        ("way", 400), ("big", 400), ("double", 400), ("twice", 400)]
 
+
+def parse_direction(text):
+    """'go a little to the right' -> ('right', 1, 0)"""
+    t = " " + re.sub(r"[^a-z0-9 ]", " ", text.lower()) + " "
+    t = t.replace(" upward ", " up ").replace(" downward ", " down ")
+    t = t.replace(" upper ", " up ").replace(" lower ", " down ")
+    t = t.replace(" top ", " up ").replace(" bottom ", " down ")
+    t = t.replace(" towards the top ", " up ")
+    h = v = 0
+    for w, s in _DIR_H.items():
+        if re.search(rf"\b{w}\b", t):
+            h = s
+            break
+    for w, s in _DIR_V.items():
+        if re.search(rf"\b{w}\b", t):
+            v = s
+            break
+    if h and v:
+        return ("up right" if v < 0 else "down right") if h > 0 else \
+               ("up left" if v < 0 else "down left"), h, v
+    if h:
+        return ("right" if h > 0 else "left"), h, 0
+    if v:
+        return ("down" if v > 0 else "up"), 0, v
+    return "", 0, 0
+
+
+def parse_move_amount(text, default=200):
+    t = text.lower()
+    m = re.search(r"\b(\d{2,4})\b", t)                 # explicit pixels
+    if m:
+        return max(5, min(3000, int(m.group(1))))
+    for word, val in _MAG:
+        if word in t:
+            return val
+    return default
+
+
+def _cursor_pos():
+    import ctypes
+    from ctypes import wintypes
     pt = wintypes.POINT()
-    _user32.GetCursorPos(ctypes.byref(pt))
-    x, y = pt.x, pt.y
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
 
-    dx, dy = 0, 0
-    d = direction.lower().strip()
-    
-    # Normalize compound directions
-    d = d.replace("upper ", "up ").replace("lower ", "down ")
-    
-    # Parse direction - STRICT, no fallback to scroll
-    if "up" in d and "right" in d:      dx, dy = amount, -amount
-    elif "up" in d and "left" in d:     dx, dy = -amount, -amount
-    elif "down" in d and "right" in d:  dx, dy = amount, amount
-    elif "down" in d and "left" in d:   dx, dy = -amount, amount
-    elif "right" in d:                  dx = amount
-    elif "left" in d:                   dx = -amount
-    elif "up" in d:                     dy = -amount
-    elif "down" in d:                   dy = amount
-    else:
-        # NEVER default to scroll - just fail gracefully
-        print(f"  [!] Unknown direction: '{direction}' - skipping")
-        speak(f"Unknown direction")
+
+def _set_cursor(x, y):
+    import ctypes
+    u = ctypes.windll.user32
+    # keep it off (0,0): pyautogui's FAILSAFE corner
+    u.SetCursorPos(int(max(2, min(x, 100000))), int(max(2, min(y, 100000))))
+
+
+def move_mouse(direction, amount=None):
+    import pyautogui
+    name, h, v = parse_direction(direction)
+    if not h and not v:
+        speak("Which direction?")
         return
+    if amount in (None, 0):
+        amount = parse_move_amount(direction)
 
     screen_w, screen_h = pyautogui.size()
-    new_x = max(0, min(screen_w - 1, x + dx))
-    new_y = max(0, min(screen_h - 1, y + dy))
+    x, y = _cursor_pos()
+    dx = h * amount
+    dy = v * amount
+    if h and v:                    # keep diagonals from being ~1.4x faster
+        dx, dy = int(dx * 0.707), int(dy * 0.707)
 
-    # Size description for feedback
-    if amount <= 60:        size_desc = "a little"
-    elif amount <= 120:     size_desc = "half"
-    elif amount <= 250:     size_desc = ""
-    elif amount <= 400:     size_desc = "a lot"
-    else:                   size_desc = "far"
+    nx = max(1, min(screen_w - 2, x + dx))
+    ny = max(1, min(screen_h - 2, y + dy))
 
-    speak(f"Moving {direction} {size_desc}".strip())
-    _user32.SetCursorPos(new_x, new_y)
-    print(f"  [Move] {direction} by {amount}px: ({x},{y}) -> ({new_x},{new_y})")
+    if nx == x and ny == y:
+        # pinned against an edge: scrolling is what the user almost certainly meant
+        if v and not h:
+            clicks = -12 if v > 0 else 12          # wheel: negative = down
+            try:
+                hw_scroll(clicks)
+                speak(f"At the screen edge - scrolling {'down' if v > 0 else 'up'}")
+            except Exception:
+                speak("Cursor is already at the screen edge")
+        else:
+            speak("Cursor is already at the screen edge")
+        return
+
+    _set_cursor(nx, ny)
+    print(f"  [Move] {name} {amount}px: ({x},{y}) -> ({nx},{ny})")
+    speak(f"Moving {name}")
 
 
 def click_here():
@@ -686,65 +734,71 @@ def strip_wake(text):
     return t  # No wake word found, return as-is
 
 
+_EXIT_WORDS = ("exit", "quit", "shutdown", "shut down", "terminate", "goodbye",
+               "bye", "kill yourself", "close yourself", "turn off", "power off",
+               "stop forever", "die", "shut yourself down")
+_SCREEN_WORDS = ("click", "press", "tap", "open", "close", "tab", "window", "page",
+                 "button", "link", "menu", "dialog", "save", "file", "search")
+_SLEEP_WORDS = ("go to sleep", "sleep now", "sleep mode", "sleep", "goodnight",
+                "good night", "standby", "stand by", "stop listening",
+                "pause listening", "be quiet", "quiet mode", "silent mode",
+                "take a break", "rest now")
+_MEDIA_WORDS = ("video", "music", "song", "movie", "playback", "media", "volume",
+                "playlist", "the track")
+
+
+def _clean(text):
+    t = text.lower().replace("'", "").replace("\u2019", "")   # "that's" -> "thats"
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", t)).strip()
+
+
+_FILLERS = {"please", "now", "right", "immediately", "rolex", "can", "could",
+            "you", "would", "just", "go", "and", "the", "program", "app",
+            "application", "assistant", "for", "good", "ok", "okay"}
+
+
+def _core_words(rest):
+    """Drop politeness / filler words so 'can you exit please' == 'exit'."""
+    return " ".join(w for w in rest.split() if w not in _FILLERS)
+
+
 def is_exit(text):
-    """
-    Check if user wants to EXIT the program.
-    MUST contain the word 'rolex' to prevent accidental exits.
-    """
-    if not text:
+    """Exit ONLY on an explicit exit word that is not part of a screen command."""
+    if not text or not has_wake(text):
         return False
-    t = text.lower().strip()
-    
-    # Safety check: must have "rolex" in the command
-    if not has_wake(t):
+    rest = _clean(strip_wake(text))
+    if not rest:
         return False
-    
-    # Check if any exit phrase matches
-    for phrase in EXIT_PHRASES:
-        if phrase in t:
-            return True
-    
-    # Also check: "rolex" + any exit keyword
-    exit_keywords = ["exit", "quit", "shutdown", "shut down", "close yourself",
-                     "terminate", "turn off", "power off", "kill yourself",
-                     "goodbye", "die", "stop forever"]
-    for kw in exit_keywords:
-        if kw in t:
-            return True
-    
+    core = _core_words(rest)
+    if core in ("exit", "quit", "shutdown", "shut down", "terminate", "goodbye",
+                "bye", "kill yourself", "close yourself", "turn off", "power off",
+                "stop forever", "die", "shut yourself down"):
+        return True
+    # "rolex exit the program" / "close yourself down"  (only innocuous tails)
+    tails = {"the", "program", "app", "application", "yourself", "assistant",
+             "everything", "down", "off", "out", "all", "completely"}
+    for w in _EXIT_WORDS:
+        if re.match(rf"^{re.escape(w)}\b", core):
+            extra = core[len(w):].split()
+            if all(e in tails for e in extra):
+                return True
+    # "close chrome" / "click the exit button" must NOT count as exit
+    if any(re.search(rf"\b{re.escape(w)}\b", rest) for w in _SCREEN_WORDS):
+        return False
     return False
 
 
 def is_sleep_command(text):
-    """
-    Check if user wants Rolex to SLEEP.
-    MUST contain the word 'rolex' to prevent accidental sleep.
-    """
-    if not text:
+    if not text or not has_wake(text):
         return False
-    t = text.lower().strip()
-    
-    # Safety check: must have "rolex" in the command
-    if not has_wake(t):
+    rest = _clean(strip_wake(text))
+    if not rest:
         return False
-    
-    # Check if any sleep phrase matches
-    for phrase in SLEEP_PHRASES:
-        if phrase in t:
-            return True
-    
-    # Also check: "rolex" + any sleep keyword
-    sleep_keywords = ["sleep", "goodnight", "good night", "standby", "stand by",
-                      "stop listening", "pause listening", "be quiet", "quiet mode",
-                      "silent mode", "rest now", "take a break", "pause"]
-    for kw in sleep_keywords:
-        # Pause alone could be play/pause media - must have "listening" or be "pause rolex"
-        if kw == "pause" and "listening" not in t and "rolex" not in t:
-            continue
-        if kw in t:
-            return True
-    
-    return False
+    if any(re.search(rf"\b{re.escape(w)}\b", rest) for w in _MEDIA_WORDS):
+        return False                       # "pause the video" is media, not sleep
+    if rest in ("pause", "rest", "quiet", "silent"):   # bare word = sleep
+        return True
+    return any(re.search(rf"\b{re.escape(w)}\b", rest) for w in _SLEEP_WORDS)
 
 APP_MAP = {
     "chrome":          ("start", "chrome"),
@@ -926,81 +980,179 @@ for v in voices:
         break
 engine.setProperty("rate", 180)
 engine.setProperty("volume", 0.9)
-tts_lock = threading.Lock()
 
-# Short, fast speech — use async mode so actions don't wait
-_speech_queue = []
-_speech_thread = None
+import queue
+
+_tts_lock = threading.Lock()
+_speech_q: "queue.Queue[str]" = queue.Queue()
+_tts_busy = threading.Event()
+_worker_started = False
+
 
 def _speech_worker():
-    global _speech_queue
-    while _speech_queue:
-        txt = _speech_queue.pop(0)
+    # pyttsx3 uses SAPI5 (COM) -> every thread that touches it needs CoInitialize
+    try:
+        import pythoncom          # pip install pywin32
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
+    while True:
+        text = _speech_q.get()
+        if text is None:
+            return
         try:
-            with tts_lock:
-                engine.say(txt)
-                engine.runAndWait()
-        except Exception:
-            pass
-
-def speak(text, wait=False):
-    """Non-blocking by default. Pass wait=True to block (rarely needed)."""
-    global _speech_thread
-    print(f"  [Astra] {text}")
-    if wait:
-        with tts_lock:
-            try:
+            with _tts_lock:
                 engine.say(text)
                 engine.runAndWait()
+        except Exception as e:
+            print(f"  [!] TTS error: {e}")
+        finally:
+            _speech_q.task_done()
+            if _speech_q.empty():
+                _tts_busy.clear()
+
+
+def speak(text, wait=False):
+    """Queue speech. Never spawns a second engine thread (that was the race)."""
+    global _worker_started
+    print(f"  [Astra] {text}")
+    if not _worker_started:
+        threading.Thread(target=_speech_worker, daemon=True).start()
+        _worker_started = True
+    _tts_busy.set()
+    _speech_q.put(text)
+    if wait:
+        wait_for_tts()
+
+
+def wait_for_tts(timeout=10.0):
+    """Block until the TTS queue is drained. Call this BEFORE opening the mic."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if not _tts_busy.is_set() and _speech_q.empty():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+# ---- Audio Capture -----------------------------------------------------------
+
+_mic_lock = threading.Lock()
+_mic_device_cache = {"index": None}
+_MIC_RATE_CACHE = {"rate": None}
+SILENCE_THRESHOLD_FLOOR = 90      # absolute minimum RMS on int16
+MIC_CALIBRATE_BLOCKS = 3          # 0.3 s of "room tone" at the start
+
+
+def _pick_input_device():
+    """First real capture device: skip loopback / stereo-mix / virtual cables."""
+    import sounddevice as sd
+    if _mic_device_cache["index"] is not None:
+        return _mic_device_cache["index"]
+    bad = ("stereo mix", "loopback", "what u hear", "virtual", "cable output",
+           "wave out", "line in")
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] < 1:
+                continue
+            name = d["name"].lower()
+            if any(b in name for b in bad):
+                continue
+            _mic_device_cache["index"] = i
+            print(f"  [Mic] using [{i}] {d['name']}")
+            return i
+    except Exception as e:
+        print(f"  [!] Device enumeration failed: {e}")
+    _mic_device_cache["index"] = None
+    return None
+
+
+def _open_input_stream(sd, max_seconds):
+    """Try device/rate/rate-fallback combos until one opens."""
+    dev = _pick_input_device()
+    tries = []
+    for rate in ([_MIC_RATE_CACHE["rate"]] if _MIC_RATE_CACHE["rate"] else
+                 [44100, 48000, 16000]):
+        for ch in (1, 2):
+            tries.append((rate, ch))
+    last = None
+    for rate, ch in tries:
+        block = int(rate * 0.1)
+        try:
+            stream = sd.InputStream(device=dev, samplerate=rate, channels=ch,
+                                    dtype="int16", blocksize=block)
+            stream.start()
+            _MIC_RATE_CACHE["rate"] = rate
+            return stream, rate, ch, block
+        except Exception as e:
+            last = e
+            continue
+    print(f"  [!] No working input config: {last}")
+    return None, None, None, None
+
+
+def record_audio(max_seconds=10, pre_roll=0.0):
+    """
+    Returns int16 mono numpy array, or None if nothing above the noise floor.
+    Records until 1 s of silence after speech, or max_seconds.
+    """
+    import sounddevice as sd
+    with _mic_lock:                              # ← only one listener at a time
+        stream, rate, ch, block = _open_input_stream(sd, max_seconds)
+        if stream is None:
+            return None
+        frames, noise, has_speech, quiet = [], [], False, 0
+        need_quiet = 10                          # 10 x 0.1 s = 1 s of silence
+        try:
+            for i in range(int(max_seconds / 0.1)):
+                data, overflowed = stream.read(block)
+                mono = data[:, 0] if data.ndim > 1 else data.flatten()
+                frames.append(mono.copy())
+                rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
+
+                if i < MIC_CALIBRATE_BLOCKS:     # learn the room noise
+                    noise.append(rms)
+                    continue
+
+                floor = max(SILENCE_THRESHOLD_FLOOR,
+                            (sum(noise) / max(len(noise), 1)) * 2.5 + 40)
+                if rms > floor:
+                    has_speech = True
+                    quiet = 0
+                elif has_speech:
+                    quiet += 1
+                    if quiet >= need_quiet:
+                        break
+            return np.concatenate(frames) if has_speech else None
+        except Exception as e:
+            print(f"  [!] Recording error: {e}")
+            return None
+        finally:
+            try:
+                stream.stop()
+                stream.close()                   # ← was skipped on exceptions
             except Exception:
                 pass
-        return
-    _speech_queue.append(text)
-    if _speech_thread is None or not _speech_thread.is_alive():
-        _speech_thread = threading.Thread(target=_speech_worker, daemon=True)
-        _speech_thread.start()
 
 
-# ---- Audio ------------------------------------------------------------------
-
-def record_audio(max_seconds=MAX_RECORD_SECONDS):
-    frames = []
-    silence_count = 0
-    has_speech = False
-    block_dur = 0.1
-    block_size = int(MIC_SAMPLE_RATE * block_dur)
-    max_blocks = int(max_seconds / block_dur)
-    silence_needed = int(SILENCE_DURATION / block_dur)
-
+def drain_mic(seconds=0.25):
+    """Throw away whatever is sitting in the mic buffer (our own TTS echo)."""
     try:
-        stream = sd.InputStream(
-            samplerate=MIC_SAMPLE_RATE, channels=MIC_CHANNELS,
-            dtype="int16", blocksize=block_size,
-        )
-        stream.start()
-        for _ in range(max_blocks):
-            data, _ = stream.read(block_size)
-            mono = data[:, 0] if data.ndim > 1 else data.flatten()
-            frames.append(mono.copy())
-            rms = np.sqrt(np.mean(mono.astype(np.float32) ** 2))
-            if rms > SILENCE_THRESHOLD:
-                has_speech = True
-                silence_count = 0
-            else:
-                silence_count += 1
-            if has_speech and silence_count >= silence_needed:
-                break
-        stream.stop()
-        stream.close()
-        return np.concatenate(frames) if has_speech else None
-    except Exception as e:
-        print(f"  [!] Recording error: {e}")
-        return None
+        import sounddevice as sd
+        dev, rate = _pick_input_device(), _MIC_RATE_CACHE["rate"] or 44100
+        with sd.InputStream(device=dev, samplerate=rate, channels=1,
+                            dtype="int16") as s:
+            end = time.time() + seconds
+            while time.time() < end:
+                s.read(int(rate * 0.05))
+    except Exception:
+        pass
 
 
 def audio_to_wav_bytes(audio):
-    if MIC_SAMPLE_RATE != 16000:
-        ratio = 16000 / MIC_SAMPLE_RATE
+    rate = _MIC_RATE_CACHE.get("rate") or 44100
+    if rate != 16000:
+        ratio = 16000 / rate
         new_len = int(len(audio) * ratio)
         indices = np.linspace(0, len(audio) - 1, new_len).astype(int)
         audio = audio[indices]
@@ -1021,26 +1173,45 @@ except ImportError:
     _sr_module = None
     print("  [!] speech_recognition not installed")
 
+_stt_fail_streak = {"n": 0}
+
 
 def transcribe(audio):
     if _sr_module is None:
+        print("  [!] speech_recognition missing: pip install SpeechRecognition")
         return None
+    if audio is None or len(audio) < 1600:       # < 0.1 s
+        return None
+    wav = audio_to_wav_bytes(audio)
+    rec = _sr_module.Recognizer()
+    data = _sr_module.AudioData(wav, 16000, 2)
     try:
-        wav = audio_to_wav_bytes(audio)
-        rec = _sr_module.Recognizer()
-        audio_data = _sr_module.AudioData(wav, 16000, 2)
-        return rec.recognize_google(audio_data).lower().strip()
+        text = rec.recognize_google(data)
+        _stt_fail_streak["n"] = 0
+        return text.lower().strip()
+    except _sr_module.UnknownValueError:
+        print("  [STT] Google: nothing intelligible (silence / too quiet / noise)")
+        return None
+    except _sr_module.RequestError as e:
+        _stt_fail_streak["n"] += 1
+        print(f"  [STT] Google unreachable ({e}) - streak={_stt_fail_streak['n']}")
+        if _stt_fail_streak["n"] == 3:
+            print("  [!] STT is failing repeatedly -> check internet / firewall.")
+        return None
     except Exception as e:
-        print(f"  [!] Transcription error: {e}")
+        print(f"  [!] Transcription error: {type(e).__name__}: {e}")
         return None
 
 
 def listen(prompt=None, timeout=MAX_RECORD_SECONDS):
     if prompt:
         speak(prompt)
+    wait_for_tts()          # ← don't open the mic while we are still talking
+    drain_mic(0.25)         # ← discard buffered echo
     print("  [*] Listening...")
     audio = record_audio(max_seconds=timeout)
     if audio is None:
+        print("  [..] No speech detected")
         return None
     print("  [*] Recognizing...")
     text = transcribe(audio)
@@ -1067,20 +1238,29 @@ STOP_PHRASES = [
     "rolex stop", "stop rolex"
 ]
 
+_STOP_WHOLE = {"stop", "stop it", "stop now", "stop stop", "ok stop", "okay stop",
+               "enough", "that is enough", "thats enough", "halt", "cease",
+               "quit it", "stop scrolling", "stop moving", "freeze", "stop please",
+               "that is good", "thats good", "good enough", "rolex stop",
+               "stop rolex", "cancel"}
+
+
 def is_stop_command(text):
-    """Check if text contains a stop command."""
+    """Only a stop that is basically the whole utterance counts."""
     if not text:
         return False
-    t = text.lower().strip()
-    # Don't false-trigger on setup commands like "scroll down until stop"
-    if any(k in t for k in ("until", "till", "keep scrolling", "keep moving", "forever", "continuously")):
+    t = _clean(text)
+    if any(k in t for k in ("until", "till", "keep scrolling", "keep moving",
+                            "forever", "continuously")):
         return False
-    # Don't false-trigger on key holding like "hold shift" or "hold down ctrl"
     if re.search(r"\bhold\s+(?:down\s+)?(?:the\s+)?\w+\b", t):
         return False
-    for phrase in STOP_PHRASES:
-        if re.search(r"\b" + re.escape(phrase) + r"\b", t):
-            return True
+    if t in _STOP_WHOLE:
+        return True
+    if len(t.split()) <= 3 and re.match(
+            r"^(?:ok(?:ay)?\s+|please\s+|hey\s+)?(?:rolex\s+)?"
+            r"(stop|halt|enough|cease|freeze)\b", t):
+        return True
     return False
 
 def stop_continuous_action():
@@ -1741,66 +1921,38 @@ def ocr_screen(force=False):
     return words
 
 
-def find_on_screen(target, occurrence=1, prefer_region=None):
-    print(f"  [*] Scanning screen for: \"{target}\" (occurrence #{occurrence})")
-    words = ocr_screen()
+def find_on_screen(target, occurrence=1, prefer_region=None, force_ocr=False):
+    words = ocr_screen(force=force_ocr)        # ← fresh OCR when requested
     if not words:
-        print("  [!] No text on screen.")
         return None
-
+    from difflib import SequenceMatcher
+    import pyautogui
     target_low = target.lower().strip()
-    target_parts = target_low.split()
     screen_h = pyautogui.size()[1]
-
     matches = []
-
     for w in words:
-        score = 0
         if w["text"] == target_low:
             score = 1.0
-        elif target_low in w["text"] or w["text"] in target_low:
-            score = SequenceMatcher(None, target_low, w["text"]).ratio()
         else:
-            r = SequenceMatcher(None, target_low, w["text"]).ratio()
-            if r > 0.6:
-                score = r
-        if score > 0.5:
-            matches.append({"word": w, "score": score})
-
-    # Multi-word: sort words by position first to get reading order
-    if len(target_parts) > 1:
-        sorted_words = sorted(words, key=lambda w: (w["y"] // 20, w["x"]))
-        texts = [w["text"] for w in sorted_words]
-        for i in range(len(texts) - len(target_parts) + 1):
-            chunk = " ".join(texts[i:i + len(target_parts)])
-            r = SequenceMatcher(None, target_low, chunk).ratio()
-            if r > 0.7:
-                mid = i + len(target_parts) // 2
-                matches.append({"word": sorted_words[mid], "score": r})
-
+            score = SequenceMatcher(None, target_low, w["text"]).ratio()
+        if score > 0.6:
+            matches.append((score, w))
     if not matches:
-        print(f"  [X] \"{target}\" not found.")
         return None
-
-    matches.sort(key=lambda m: m["score"], reverse=True)
-
+    # for "the 2nd X", document order is what the user means - not 2nd best score
+    matches.sort(key=lambda m: (m[1]["y"] // 20, m[1]["x"]))
     if prefer_region and len(matches) > 1:
-        for m in matches:
-            y = m["word"]["y"]
-            if prefer_region == "top" and y < screen_h * 0.33:
-                m["score"] += 0.1
-            elif prefer_region == "bottom" and y > screen_h * 0.66:
-                m["score"] += 0.1
-            elif prefer_region == "center" and screen_h * 0.2 < y < screen_h * 0.8:
-                m["score"] += 0.05
-        matches.sort(key=lambda m: m["score"], reverse=True)
-
+        def bonus(w):
+            if prefer_region == "top" and w["y"] < screen_h * 0.33:
+                return 0.1
+            if prefer_region == "bottom" and w["y"] > screen_h * 0.66:
+                return 0.1
+            return 0.0
+        matches.sort(key=lambda m: -(m[0] + bonus(m[1])))
     if occurrence > len(matches):
         occurrence = len(matches)
-    pick = matches[occurrence - 1]
-
-    w = pick["word"]
-    print(f"  [OK] Match #{occurrence}: \"{w['text']}\" (score={pick['score']:.2f}) at ({w['x']},{w['y']})")
+    w = matches[occurrence - 1][1]
+    print(f"  [OK] #{occurrence}: \"{w['text']}\" at ({w['x']},{w['y']})")
     return (w["x"], w["y"])
 
 
@@ -1869,9 +2021,32 @@ def parse_number_words(text):
     return None
 
 
+_SHORTCUTS = [("select all", "ctrl a"), ("copy", "ctrl c"), ("paste", "ctrl v"),
+              ("cut", "ctrl x"), ("undo", "ctrl z"), ("redo", "ctrl y"),
+              ("save as", "ctrl shift s"), ("save", "ctrl s"), ("find", "ctrl f"),
+              ("refresh", "f5"), ("reload", "f5")]
+
+
+def apply_shortcuts(t):
+    """t is the padded lower-case string. Only expand when the word IS the command."""
+    for word, combo in _SHORTCUTS:
+        t = re.sub(rf"^\s*(?:press\s+|do\s+)?{re.escape(word)}"
+                   rf"(?:\s+(?:now|please|it))?\s*$", f" press {combo} ", t)
+    return t
+
+
+def apply_path_prepositions(t):
+    if re.search(r"(folder|directory|drive|disk|file explorer|explorer|documents|"
+                 r"downloads|pictures|movies|music|videos)", t):
+        for w in (" inside ", " within ", " under ", " into ", " from ", " of "):
+            t = t.replace(w, " in ")
+    return t
+
+
 def normalize_command(text):
     """Expand slang/synonyms into canonical verbs so the parser catches them."""
     t = " " + text.lower().strip() + " "
+    t = apply_shortcuts(t)
 
     # Click here synonyms (must run before click_syn so "click at" doesn't swallow "click at cursor")
     t = t.replace(" click right here ", " click here ")
@@ -2080,19 +2255,6 @@ def normalize_command(text):
     t = t.replace(" key combo ", " press ")
     t = t.replace(" key combination ", " press ")
 
-    # Common combos spoken as words
-    t = t.replace(" copy ", " press ctrl c ")
-    t = t.replace(" paste ", " press ctrl v ")
-    t = t.replace(" cut ", " press ctrl x ")
-    t = t.replace(" undo ", " press ctrl z ")
-    t = t.replace(" redo ", " press ctrl y ")
-    t = t.replace(" save as ", " press ctrl shift s ")
-    t = t.replace(" save ", " press ctrl s ")
-    t = t.replace(" select all ", " press ctrl a ")
-    t = t.replace(" find ", " press ctrl f ")
-    t = t.replace(" refresh ", " press f5 ")
-    t = t.replace(" reload ", " press f5 ")
-
     # Repeat word variants
     t = t.replace(" couple times ", " 2 times ")
     t = t.replace(" couple of times ", " 2 times ")
@@ -2146,13 +2308,8 @@ def normalize_command(text):
     t = t.replace(" after this ", " then ")
     t = t.replace(" subsequently ", " then ")
     
-    # Folder navigation words
-    t = t.replace(" inside ", " in ")
-    t = t.replace(" within ", " in ")
-    t = t.replace(" under ", " in ")
-    t = t.replace(" into ", " in ")
-    t = t.replace(" from ", " in ")
-    t = t.replace(" of ", " in ")
+    # Folder navigation words (context-aware only)
+    t = apply_path_prepositions(t)
     
     # Path separator
     t = t.replace(" slash ", " in ")
@@ -2408,46 +2565,45 @@ def smart_search_youtube(query):
 
 # ---- Multi-Step Command Planner (breaks complex commands into steps) ------
 
+_SIMPLE_STARTS = ("go", "move", "scroll", "cursor", "stop", "press", "type",
+                  "next", "previous", "prev", "play", "pause", "volume", "mute",
+                  "minimize", "maximize", "restore", "screenshot")
+
+
 def is_multi_step_command(text):
-    """Detect if a command needs multiple steps to execute."""
-    t = text.lower().strip()
-    
-    # Multiple "then" / "and then" / "after that"
-    if re.search(r"\b(then|after that|next|and then|afterwards)\b", t):
+    t = re.sub(r"\s+", " ", text.lower().strip())
+    # hard exclusions first
+    if re.search(r"\b(?:next|previous|prev)\s+tab\b", t):
+        return False
+    if re.search(r"\b(?:go|move)\s+(?:up|down|left|right|up right|down left)\b", t):
+        return False
+    # "minimize chrome and open vlc" IS multi-step -> check before the guard
+    if re.search(r"\b(?:open|close|minimize|maximize|click|launch)\b.+\band\b.+"
+                 r"\b(?:open|close|minimize|maximize|click|launch|play|type)\b", t):
         return True
-    
-    # Path-like: "in X in Y in Z" / "inside X folder"
-    if t.count(" in ") >= 2:
+    if re.match(rf"^(?:{'|'.join(_SIMPLE_STARTS)})\b", t) and \
+       not re.search(r"\b(?:then|and then|after that)\b", t):
+        return False
+    if re.search(r"\b(?:then|and then|after that|afterwards|following that)\b", t):
         return True
-    
-    # Navigation: "go to X then open Y"
-    if re.search(r"(go to|navigate to|open).+(then|and|after).+(open|click|find|select)", t):
+    if t.count(" in ") >= 2 and re.search(
+            r"(folder|directory|drive|disk|file explorer|explorer|documents|"
+            r"downloads|pictures|movies|music|videos)", t):
         return True
-    
-    # File explorer paths: "open X in Y folder"
-    if re.search(r"open\s+.+\s+in\s+.+\s*(folder|directory|drive|disk)", t):
-        return True
-    
-    # Complex open: "open X in Y in Z"
     if re.search(r"open\s+.+\s+in\s+.+\s+in\s+", t):
         return True
-    
-    # Chrome complex: "open youtube and search for X"
+    if re.search(r"(?:open|find|go to)\s+.+\s+in\s+.+\s*(?:folder|directory|"
+                 r"documents|downloads|desktop|pictures|movies|music|videos|"
+                 r"drive|disk)", t):
+        return True
     if re.search(r"open\s+\w+\s+and\s+(search|type|go to|find|play)", t):
         return True
-    
-    # "find X in Y" with app context
-    if re.search(r"(find|search for|look for)\s+.+\s+in\s+(file explorer|chrome|browser|explorer|downloads|documents|desktop|movies|music|pictures|videos)", t):
+    if re.search(r"(find|search for|look for)\s+.+\s+in\s+(file explorer|chrome|"
+                 r"browser|explorer|downloads|documents|desktop|movies|music)", t):
         return True
-    
-    # Multiple actions: "minimize chrome and open vlc"
-    if re.search(r"(open|close|minimize|maximize|click)\s+.+\s+and\s+(open|close|minimize|maximize|click)", t):
+    if re.search(r"(open|close|minimize|maximize|click)\s+.+\s+and\s+"
+                 r"(open|close|minimize|maximize|click)", t):
         return True
-    
-    # Step-like: first...then / after opening...do
-    if re.search(r"(first|after opening|after going|once you|when you)", t):
-        return True
-    
     return False
 
 
@@ -2632,6 +2788,15 @@ def parse_plan(plan_text):
     return steps if steps else None
 
 
+def plan_should_cancel():
+    """Only cancel if a continuous action is actually running and was stopped."""
+    try:
+        return bool(_continuous_action.get("running")) and \
+            _continuous_action["stop_flag"].is_set()
+    except Exception:
+        return False
+
+
 def execute_plan(steps, user_text=""):
     """
     Execute a multi-step plan.
@@ -2650,12 +2815,9 @@ def execute_plan(steps, user_text=""):
     
     for i, step in enumerate(steps):
         # Check if user stopped
-        try:
-            if _continuous_action.get("stop_flag") and _continuous_action["stop_flag"].is_set():
-                speak("Plan cancelled")
-                return
-        except Exception:
-            pass
+        if plan_should_cancel():
+            speak("Plan cancelled")
+            return
         
         if step["type"] == "wait":
             secs = step["seconds"]
@@ -2665,7 +2827,7 @@ def execute_plan(steps, user_text=""):
         
         if step["type"] == "confirm":
             msg = step.get("message", "Should I continue?")
-            speak(msg)
+            speak(msg, wait=True)
             response = listen(timeout=8)
             if response:
                 r = response.lower()
@@ -2690,7 +2852,7 @@ def execute_plan(steps, user_text=""):
                 
                 # Check for unknown/failed parse
                 if action == "unknown":
-                    speak(f"Step {cmd_num} unclear: {cmd}. Skip or retry?")
+                    speak(f"Step {cmd_num} unclear: {cmd}. Skip or retry?", wait=True)
                     response = listen(timeout=8)
                     if response:
                         r = response.lower()
@@ -2892,6 +3054,49 @@ def plan_locally(text):
     return None
 
 
+_TAB_NUM = re.compile(r"(?:go to|switch to|jump to|change to|move to|open)\s+"
+                      r"(?:the\s+)?(?:tab\s+(\d+)|(\d+)(?:st|nd|rd|th)?\s+tab)")
+_TAB_ORD = re.compile(r"(?:go to|switch to|jump to|change to|move to|open)\s+"
+                      r"(?:the\s+)?(\w+)\s+tab\b")
+_TAB_BARE = re.compile(r"^tab\s+(\d+)$")
+
+
+def parse_tab(text):
+    """Returns ('number', n) | ('name', name) | None"""
+    t = re.sub(r"\s+", " ", text.lower().strip())
+    for rx in (_TAB_NUM, _TAB_BARE):
+        m = rx.search(t)
+        if m:
+            n = int([g for g in m.groups() if g and g.isdigit()][0])
+            if 1 <= n <= 9:
+                return ("number", n)
+    m = _TAB_ORD.search(t)
+    if m:
+        word = m.group(1)
+        n = ORDINALS.get(word) or (int(word) if word.isdigit() else None)
+        if n and 1 <= n <= 9:
+            return ("number", n)
+        if word not in ("the", "a", "this", "that", "bar"):
+            return ("name", word)
+    return None
+
+
+_RE_BACKWARD = re.compile(r"(rewind|backward|skip back|previous chapter|"
+                          r"back\s+\d+\s*(?:seconds|secs|s)\b)")
+_RE_FORWARD = re.compile(r"(fast.?forward|skip forward|skip ahead|"
+                         r"forward\s+\d+\s*(?:seconds|secs|s)\b)")
+_RE_GO_BACK = re.compile(r"\b(?:go|browser)\s+back\b|^\s*back\s*$|\bprevious\s+page\b")
+
+
+def safe_last_resort(normalized_text, raw_text):
+    """Return an intent. Never click a whole sentence by accident."""
+    clean = normalized_text.strip()
+    if len(clean.split()) > 3 or re.match(r"^(the|a|an|is|am|are|was|were)$", clean):
+        print(f"  [Unknown] no rule matched: \"{raw_text}\"")
+        return {"action": "unknown", "target": raw_text}
+    return {"action": "click_word", "target": clean, "occurrence": 1}
+
+
 def parse_command(text, use_fallback=True):
     debug_log(f"parse_command input: '{text}'")
     t = normalize_command(text)
@@ -3016,31 +3221,15 @@ def parse_command(text, use_fallback=True):
         if num:
             return {"action": "chrome_account", "target": str(num)}
 
-    # ---- Tab switching by NUMBER ----
-    # "go to tab 4" / "open tab 3" / "switch to tab 2" / "tab 5"
-    # MUST come before "go to" mouse movement and before "open" app parsing
-    tab_num_match = re.search(
-        r"(?:go to|switch to|open|jump to|change to|move to)?\s*tab\s+(\w+)", t)
-    if tab_num_match:
-        word = tab_num_match.group(1).strip()
-        num = ORDINALS.get(word) or (int(word) if word.isdigit() else None)
-        if num and 1 <= num <= 9:
-            return {"action": "switch_tab_number", "target": str(num)}
-        # If not a number, it's a tab name like "go to tab gmail"
-        if word and not word.isdigit() and word not in ORDINALS:
-            return {"action": "click_tab", "target": word}
-
-    # "go to 3rd tab" / "open 2nd tab" / "switch to first tab"
-    tab_ord_match = re.search(
-        r"(?:go to|switch to|open|jump to|change to|move to)\s+(?:the\s+)?(\w+)\s+tab\b", t)
-    if tab_ord_match:
-        word = tab_ord_match.group(1).strip()
-        num = ORDINALS.get(word) or (int(word) if word.isdigit() else None)
-        if num and 1 <= num <= 9:
-            return {"action": "switch_tab_number", "target": str(num)}
-        # Not a number - it's a tab name like "go to gmail tab"
-        if word and word not in ("the", "a", "this", "that"):
-            return {"action": "click_tab", "target": word}
+    # ---- Tab switching by NUMBER or NAME ----
+    # "go to tab 4" / "open tab 3" / "switch to tab 2" / "tab 5" / "go to 2nd tab"
+    tab_res = parse_tab(t)
+    if tab_res:
+        kind, val = tab_res
+        if kind == "number":
+            return {"action": "switch_tab_number", "target": str(val)}
+        elif kind == "name":
+            return {"action": "click_tab", "target": val}
 
     # "next tab" / "previous tab"
     if re.search(r"\bnext\s+tab\b", t):
@@ -3237,22 +3426,19 @@ def parse_command(text, use_fallback=True):
     if re.search(r"(mute|unmute)", t):
         return {"action": "mute", "target": ""}
 
-    # ---- Backward FIRST (so "skip back" doesn't trigger forward) ----
-    if re.search(r"(rewind|backward|skip back|go back(ward)?|previous|back\s+\d)", t):
+    # ---- Browser back (BEFORE media rewind/forward) ----
+    if _RE_GO_BACK.search(t):
+        return {"action": "go_back", "target": ""}
+
+    # ---- Backward ----
+    if _RE_BACKWARD.search(t):
         secs = parse_number_words(t) or 10
         return {"action": "backward", "target": str(secs)}
+
     # ---- Forward ----
-    if re.search(r"(fast.?forward|skip forward|skip ahead|forward|skip)", t):
+    if _RE_FORWARD.search(t):
         secs = parse_number_words(t) or 10
         return {"action": "forward", "target": str(secs)}
-
-    # ---- Browser back (NOT "go down/up/left/right") ----
-    # Only match "go back" / "browser back", NOT "go down"
-    if re.search(r"\bbrowser\s*back\b", t) or t.strip() == "back":
-        return {"action": "go_back", "target": ""}
-    if re.search(r"\bgo\s+back\b", t):
-        # Make sure it's NOT "go back" in the context of rewind (already caught)
-        return {"action": "go_back", "target": ""}
 
     # ---- Fullscreen ----
     if re.search(r"(full.?screen|enter full|exit full)", t):
@@ -3545,12 +3731,8 @@ def parse_command(text, use_fallback=True):
                     return {"action": "open_app", "target": kw}
                 return {"action": "click_word", "target": kw, "occurrence": 1}
 
-    # Last resort: treat as click target (ONLY if meaningful)
-    if len(t.strip()) > 2 and not re.match(r"^(the|a|an|is|am|are|was|were)$", t.strip()):
-        return {"action": "click_word", "target": t, "occurrence": 1}
-    
-    # Nothing matched - do nothing instead of defaulting to scroll
-    return {"action": "unknown", "target": text}
+    # Last resort: safely determine if it's a short click target or unknown
+    return safe_last_resort(t, text)
 
 
 # ---- Actions ----------------------------------------------------------------
@@ -3713,22 +3895,24 @@ def click_word(word, occurrence=1):
     speak(f"Clicking {word}")
     coords = find_on_screen(word, occurrence=occurrence, prefer_region="center")
     if coords:
-        smart_click(coords[0], coords[1])
+        smart_click(*coords)
         return
-    hw_scroll(-5); time.sleep(0.4)
-    coords = find_on_screen(word, occurrence=occurrence)
+    hw_scroll(-5)
+    time.sleep(0.6)
+    coords = find_on_screen(word, occurrence=occurrence, force_ocr=True)  # fresh OCR
     if coords:
-        smart_click(coords[0], coords[1])
+        smart_click(*coords)
         return
     hw_scroll(5)
+    time.sleep(0.4)
     if ollama_ok():
         kw = extract_keyword(f"click {word}")
         if kw and kw != word:
-            c2 = find_on_screen(kw)
+            c2 = find_on_screen(kw, force_ocr=True)
             if c2:
-                smart_click(c2[0], c2[1])
+                smart_click(*c2)
                 return
-    speak(f"Can't find {word}")
+    speak(f"I can't find {word} on screen")
 
 
 def click_image(description):
@@ -4394,6 +4578,9 @@ def main():
 
             # ================== ACTIVE MODE ==================
             else:
+                if _continuous_action.get("running"):
+                    time.sleep(0.2)      # stop-listener is using the mic
+                    continue
                 print("\n  [ACTIVE] Listening for command...")
                 text = listen(timeout=15)
                 

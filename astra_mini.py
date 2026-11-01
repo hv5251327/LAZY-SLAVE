@@ -1048,6 +1048,9 @@ def listen(prompt=None, timeout=MAX_RECORD_SECONDS):
         print(f"  [Heard] \"{text}\"")
     return text
 
+recognize_speech = listen
+
+
 
 # ---- Continuous action control --------------------------------------------
 _continuous_action = {
@@ -2226,6 +2229,23 @@ def get_foreground_window_info():
         return cls.lower(), title.lower(), proc
     except Exception:
         return "", "", ""
+
+
+# ---- Inactivity Auto-Sleep Configuration -------------------------------------
+AUTO_SLEEP_TIMEOUT = 120  # seconds of inactivity before auto-sleep
+
+def get_auto_sleep_timeout():
+    """Longer timeout if a media player or browser is in the foreground."""
+    try:
+        cls, title, proc = get_foreground_window_info()
+        media_apps = ["vlc", "chrome", "msedge", "firefox", "spotify", "brave", "opera", "mpv", "mpc-hc"]
+        proc_clean = proc.lower().replace(".exe", "") if proc else ""
+        if proc_clean in media_apps or any(m in proc.lower() for m in media_apps):
+            return 300  # 5 minutes during media / browser playback
+    except Exception:
+        pass
+    return AUTO_SLEEP_TIMEOUT  # 2 minutes normally
+
 
 def get_context():
     """Return one of: 'browser', 'explorer', 'desktop', 'editor', 'other'."""
@@ -4316,6 +4336,7 @@ def main():
     speak("Rolex ready. Say Rolex to wake me up.")
 
     active = False
+    last_command_time = time.time()
     
     while True:
         try:
@@ -4348,15 +4369,18 @@ def main():
                 
                 # ---- Strip wake word to get command ----
                 cmd = strip_wake(text)
+                active = True  # ← Activate FIRST before executing
+                last_command_time = time.time()  # ← RESET on wake
                 
                 if cmd and len(cmd.strip()) >= 1:
                     # Wake word + command: WAKE UP and execute command
                     print(f"  [Wake+Command] \"{cmd}\"")
-                    active = True  # ← Activate FIRST before executing
                     print("  [WAKE] Now active - executing command")
                     
                     try:
                         intent = parse_command(cmd)
+                        if intent.get("action") != "unknown":
+                            last_command_time = time.time()
                         execute(intent)
                     except Exception as e:
                         print(f"  [!] Error executing wake command: {e}")
@@ -4365,7 +4389,6 @@ def main():
                     print("  [ACTIVE] Ready for more commands")
                 else:
                     # Just "Rolex" alone -> activate
-                    active = True
                     speak("Yes?")
                     print("  [WAKE] Now active")
 
@@ -4375,14 +4398,29 @@ def main():
                 text = listen(timeout=15)
                 
                 if not text:
-                    print("  [...] Silence. Still active.")
+                    # Even with no speech, check timeout if active
+                    if active and (time.time() - last_command_time > get_auto_sleep_timeout()):
+                        active = False
+                        speak("Going to sleep due to inactivity.")
+                        print("  [SLEEP] Auto-sleep due to inactivity")
+                    else:
+                        remaining = int(get_auto_sleep_timeout() - (time.time() - last_command_time))
+                        print(f"  [...] Silence. Still active. (Auto-sleep in {max(0, remaining)}s)")
                     continue
                 
+                # ★ AUTO-SLEEP CHECK ON SPEECH ARRIVAL ★
+                if time.time() - last_command_time > get_auto_sleep_timeout():
+                    active = False
+                    speak("Going to sleep.")
+                    print("  [SLEEP] Inactivity timeout expired")
+                    continue
+
                 # ---- PRIORITY 1: Stop continuous action (no wake word needed) ----
                 try:
-                    if is_stop_command(text) and _continuous_action["running"]:
+                    if _continuous_action.get("running") and is_stop_command(text):
                         stop_continuous_action()
                         speak("Stopped")
+                        last_command_time = time.time()
                         continue
                 except Exception:
                     pass
@@ -4406,7 +4444,7 @@ def main():
                         stop_continuous_action()
                     except Exception:
                         pass
-                    speak("Sleeping. Say Rolex to wake me.")
+                    speak("Going to sleep.")
                     active = False
                     print("  [SLEEP] Going to sleep")
                     continue
@@ -4416,10 +4454,16 @@ def main():
                     text = strip_wake(text)
                     if not text or len(text) < 2:
                         speak("Yes?")
+                        last_command_time = time.time()
                         continue
                 
                 # ---- Execute the command (no wake word needed in active mode) ----
                 intent = parse_command(text)
+                
+                # Reset timer only for useful (non-unknown) commands
+                if intent.get("action") != "unknown":
+                    last_command_time = time.time()
+                
                 execute(intent)
 
         except KeyboardInterrupt:

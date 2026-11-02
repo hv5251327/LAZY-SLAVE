@@ -34,17 +34,131 @@ if sys.platform == "win32":
         pass
 
 
-# ---- DPI FIX: MUST run before any screen operations ------------------------
+# ---- Win32 API with proper 64-bit signatures ------------------------------
 try:
     import ctypes
+    from ctypes import wintypes
+
+    _user32 = ctypes.windll.user32
+    _shcore = None
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
-        print("  [*] DPI awareness: per-monitor")
+        _shcore = ctypes.windll.shcore
     except Exception:
-        ctypes.windll.user32.SetProcessDPIAware()        # Fallback
-        print("  [*] DPI awareness: system")
+        pass
+
+    # CRITICAL: Define argtypes/restype or 64-bit handles get truncated to 32-bit
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetForegroundWindow.argtypes = []
+
+    _user32.GetClassNameW.restype = ctypes.c_int
+    _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+    _user32.SetCursorPos.restype = wintypes.BOOL
+    _user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+
+    _user32.GetCursorPos.restype = wintypes.BOOL
+    _user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+
+    _user32.SendInput.restype = ctypes.c_uint
+    # argtypes set after INPUT struct is defined below
+
+    _user32.mouse_event.restype = None
+    _user32.mouse_event.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_uint, ctypes.c_void_p]
+
+    # DPI awareness
+    try:
+        if _shcore:
+            _shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+            _shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+            _shcore.SetProcessDpiAwareness(2)
+            print("  [*] DPI awareness: per-monitor")
+        else:
+            raise Exception("no shcore")
+    except Exception:
+        try:
+            _user32.SetProcessDPIAware.restype = wintypes.BOOL
+            _user32.SetProcessDPIAware.argtypes = []
+            _user32.SetProcessDPIAware()
+            print("  [*] DPI awareness: system")
+        except Exception as _e:
+            print(f"  [!] DPI awareness failed: {_e}")
+
+    # ---- SendInput structures ----
+    PUL = ctypes.POINTER(ctypes.c_ulong)
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                    ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong), ("dwExtraInfo", PUL)]
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", PUL)]
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("_u",)
+        _fields_ = [("type", ctypes.c_ulong), ("_u", INPUT_UNION)]
+
+    # Now set SendInput argtypes
+    _user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+
+    # Constants
+    INPUT_MOUSE          = 0
+    INPUT_KEYBOARD       = 1
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP   = 0x0004
+    MOUSEEVENTF_WHEEL    = 0x0800
+    KEYEVENTF_KEYUP      = 0x0002
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    WHEEL_DELTA          = 120
+
+    VK_VOLUME_MUTE = 0xAD
+    VK_VOLUME_DOWN = 0xAE
+    VK_VOLUME_UP   = 0xAF
+    VK_MEDIA_PLAY  = 0xB3
+    VK_MEDIA_NEXT  = 0xB0
+    VK_MEDIA_PREV  = 0xB1
+
+    _WIN32_OK = True
+    print("  [*] Win32 API initialized (64-bit safe)")
+
+    def _send_click():
+        down = INPUT(type=INPUT_MOUSE, _u=INPUT_UNION(mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTDOWN)))
+        up   = INPUT(type=INPUT_MOUSE, _u=INPUT_UNION(mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTUP)))
+        _user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
+        time.sleep(0.08)
+        _user32.SendInput(1, ctypes.byref(up),   ctypes.sizeof(INPUT))
+
+    def reliable_click(x, y):
+        x, y = int(x), int(y)
+        _user32.SetCursorPos(x, y)
+        time.sleep(0.04)
+        _send_click()
+        print(f"  [Click] ({x}, {y})")
+
+    def reliable_double_click(x, y):
+        x, y = int(x), int(y)
+        _user32.SetCursorPos(x, y)
+        time.sleep(0.04)
+        _send_click()
+        time.sleep(0.05)
+        _send_click()
+        print(f"  [DblClick] ({x}, {y})")
+
 except Exception as _e:
-    print(f"  [!] DPI awareness failed: {_e}")
+    print(f"  [!] win32 init failed ({_e}); using pyautogui fallback")
+    _WIN32_OK = False
+
+    def reliable_click(x, y):
+        pyautogui.click(x=int(x), y=int(y))
+
+    def reliable_double_click(x, y):
+        pyautogui.doubleClick(x=int(x), y=int(y))
 
 DEBUG_MODE = True  # Set to False in production
 
@@ -280,14 +394,10 @@ def close_all_minimized():
 # ---- Enhanced Minimize / Maximize / Restore (current window) --------------
 
 def minimize_current():
-    """Minimize the currently focused window."""
-    speak("Minimizing")
     try:
         hwnd = _user32.GetForegroundWindow()
-        ShowWindow(hwnd, SW_MINIMIZE)
+        _user32.ShowWindow(hwnd, SW_MINIMIZE)
     except Exception:
-        pyautogui.hotkey("win", "down")
-        time.sleep(0.1)
         pyautogui.hotkey("win", "down")
 
 def maximize_current():
@@ -468,9 +578,9 @@ def _send_key(vk, key_up=False):
     flags = KEYEVENTF_EXTENDEDKEY
     if key_up:
         flags |= KEYEVENTF_KEYUP
-    inp = INPUT_KB(type=INPUT_KEYBOARD,
-                   _u=INPUT_UNION_KB(ki=KEYBDINPUT(wVk=vk, dwFlags=flags)))
-    _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT_KB))
+    inp = INPUT(type=INPUT_KEYBOARD,
+                _u=INPUT_UNION(ki=KEYBDINPUT(wVk=vk, dwFlags=flags)))
+    _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 def press_vk(vk, times=1, delay=0.08):
     """Press a virtual-key N times via SendInput (reliable for media keys)."""
@@ -948,211 +1058,186 @@ def cached_ollama(prompt):
     return result
 
 
-# ---- Microphone -------------------------------------------------------------
-
+# ---- Mic settings (dynamic channel detection) -----------------------------
 def get_mic_settings():
     try:
         dev_idx = sd.default.device[0]
         if dev_idx < 0:
-            return 1, 44100
+            return 1, 44100, 0
         info = sd.query_devices(dev_idx)
         ch = min(int(info["max_input_channels"]), 2)
         sr = int(info["default_samplerate"])
         print(f"  [Mic] {info['name']} ({ch}ch @ {sr}Hz)")
-        return max(ch, 1), sr
+        return max(ch, 1), sr, dev_idx
     except Exception as e:
         print(f"  [!] Mic error: {e}")
-        return 1, 44100
+        return 1, 44100, 0
 
-MIC_CHANNELS, MIC_SAMPLE_RATE = get_mic_settings()
-SILENCE_THRESHOLD = 400
-SILENCE_DURATION = 1.0   # stop listening sooner after you stop talking
+MIC_CHANNELS, MIC_SAMPLE_RATE, MIC_DEVICE_IDX = get_mic_settings()
+
+# ---- Persistent noise floor (calibrated once at startup) ------------------
+NOISE_FLOOR = 300  # overridden by calibration
+SILENCE_MULT = 1.6  # silence threshold = NOISE_FLOOR * this
 MAX_RECORD_SECONDS = 10
+SILENCE_SHORT = 0.4   # for quick commands (<= 1.5s of speech)
+SILENCE_LONG  = 1.0   # for longer commands
 
-# ---- TTS --------------------------------------------------------------------
+def calibrate_noise_floor(seconds=0.6):
+    """Measure ambient noise ONCE at startup. Avoids 300ms per-command cost."""
+    global NOISE_FLOOR
+    try:
+        print(f"  [*] Calibrating noise floor ({seconds}s)...")
+        samples = int(MIC_SAMPLE_RATE * seconds)
+        data = sd.rec(samples, samplerate=MIC_SAMPLE_RATE,
+                       channels=MIC_CHANNELS, dtype="int16")
+        sd.wait()
+        mono = data[:, 0] if data.ndim > 1 else data.flatten()
+        rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
+        NOISE_FLOOR = max(150, int(rms * 1.2))
+        print(f"  [*] Noise floor: {NOISE_FLOOR}")
+    except Exception as e:
+        print(f"  [!] Calibration failed, using default: {e}")
 
-print("  [*] Initializing voice engine...")
-engine = pyttsx3.init()
-voices = engine.getProperty("voices")
-for v in voices:
-    if "zira" in v.name.lower() or "david" in v.name.lower():
-        engine.setProperty("voice", v.id)
-        break
-engine.setProperty("rate", 180)
-engine.setProperty("volume", 0.9)
+def drain_mic():
+    """Flush any buffered audio. Reduced from 250ms to 50ms."""
+    try:
+        sd.rec(int(MIC_SAMPLE_RATE * 0.05),
+                samplerate=MIC_SAMPLE_RATE,
+                channels=MIC_CHANNELS, dtype="int16")
+        sd.wait()
+    except Exception:
+        pass
 
-import queue
 
-_tts_lock = threading.Lock()
-_speech_q: "queue.Queue[str]" = queue.Queue()
-_tts_busy = threading.Event()
-_worker_started = False
+# ---- Thread-safe TTS (SAPI5 COM requires per-thread init) -----------------
+import queue as _queue
 
+_speech_queue = _queue.Queue()
+_speech_thread = None
+_speech_lock = threading.Lock()
 
 def _speech_worker():
-    # pyttsx3 uses SAPI5 (COM) -> every thread that touches it needs CoInitialize
+    """Runs in its own thread. Initializes pyttsx3 LOCALLY for COM safety."""
     try:
-        import pythoncom          # pip install pywin32
+        import pythoncom
         pythoncom.CoInitialize()
     except Exception:
         pass
-    while True:
-        text = _speech_q.get()
-        if text is None:
-            return
-        try:
-            with _tts_lock:
-                engine.say(text)
-                engine.runAndWait()
-        except Exception as e:
-            print(f"  [!] TTS error: {e}")
-        finally:
-            _speech_q.task_done()
-            if _speech_q.empty():
-                _tts_busy.clear()
 
+    try:
+        local_engine = pyttsx3.init()
+        voices = local_engine.getProperty("voices")
+        for v in voices:
+            if "zira" in v.name.lower() or "david" in v.name.lower():
+                local_engine.setProperty("voice", v.id)
+                break
+        local_engine.setProperty("rate", 190)
+        local_engine.setProperty("volume", 0.9)
+    except Exception as e:
+        print(f"  [!] TTS worker init failed: {e}")
+        return
+
+    while True:
+        try:
+            text = _speech_queue.get(timeout=60)
+            if text is None:  # sentinel to shut down
+                break
+            try:
+                local_engine.say(text)
+                local_engine.runAndWait()
+            except Exception as e:
+                print(f"  [!] TTS error: {e}")
+        except _queue.Empty:
+            continue
+
+    try:
+        local_engine.stop()
+    except Exception:
+        pass
+
+def _ensure_speech_thread():
+    global _speech_thread
+    with _speech_lock:
+        if _speech_thread is None or not _speech_thread.is_alive():
+            _speech_thread = threading.Thread(target=_speech_worker, daemon=True)
+            _speech_thread.start()
 
 def speak(text, wait=False):
-    """Queue speech. Never spawns a second engine thread (that was the race)."""
-    global _worker_started
-    print(f"  [Astra] {text}")
-    if not _worker_started:
-        threading.Thread(target=_speech_worker, daemon=True).start()
-        _worker_started = True
-    _tts_busy.set()
-    _speech_q.put(text)
+    """Non-blocking by default. TTS runs in dedicated COM-safe thread."""
+    print(f"  [Rolex] {text}")
+    _ensure_speech_thread()
+    _speech_queue.put(text)
     if wait:
-        wait_for_tts()
-
+        # Wait briefly for the queue to drain
+        while not _speech_queue.empty():
+            time.sleep(0.05)
 
 def wait_for_tts(timeout=10.0):
-    """Block until the TTS queue is drained. Call this BEFORE opening the mic."""
+    """Block until the TTS queue is drained."""
     end = time.time() + timeout
     while time.time() < end:
-        if not _tts_busy.is_set() and _speech_q.empty():
+        if _speech_queue.empty():
             return True
         time.sleep(0.05)
     return False
 
-
-# ---- Audio Capture -----------------------------------------------------------
-
-_mic_lock = threading.Lock()
-_mic_device_cache = {"index": None}
-_MIC_RATE_CACHE = {"rate": None}
-SILENCE_THRESHOLD_FLOOR = 90      # absolute minimum RMS on int16
-MIC_CALIBRATE_BLOCKS = 3          # 0.3 s of "room tone" at the start
+print("  [*] TTS engine ready (thread-safe)")
 
 
-def _pick_input_device():
-    """First real capture device: skip loopback / stereo-mix / virtual cables."""
-    import sounddevice as sd
-    if _mic_device_cache["index"] is not None:
-        return _mic_device_cache["index"]
-    bad = ("stereo mix", "loopback", "what u hear", "virtual", "cable output",
-           "wave out", "line in")
+# ---- Audio Recording & STT --------------------------------------------------
+
+def record_audio(max_seconds=MAX_RECORD_SECONDS):
+    """Adaptive VAD: short silence for quick commands, longer for complex ones."""
+    frames = []
+    silence_count = 0
+    speech_count = 0
+    has_speech = False
+    block_dur = 0.08  # 80ms blocks (faster response)
+    block_size = int(MIC_SAMPLE_RATE * block_dur)
+    max_blocks = int(max_seconds / block_dur)
+
+    threshold = max(NOISE_FLOOR * SILENCE_MULT, 300)
+
     try:
-        for i, d in enumerate(sd.query_devices()):
-            if d["max_input_channels"] < 1:
-                continue
-            name = d["name"].lower()
-            if any(b in name for b in bad):
-                continue
-            _mic_device_cache["index"] = i
-            print(f"  [Mic] using [{i}] {d['name']}")
-            return i
+        stream = sd.InputStream(
+            samplerate=MIC_SAMPLE_RATE, channels=MIC_CHANNELS,
+            dtype="int16", blocksize=block_size,
+        )
+        stream.start()
+        for _ in range(max_blocks):
+            data, _ = stream.read(block_size)
+            mono = data[:, 0] if data.ndim > 1 else data.flatten()
+            frames.append(mono.copy())
+            rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
+
+            if rms > threshold:
+                has_speech = True
+                speech_count += 1
+                silence_count = 0
+            else:
+                silence_count += 1
+
+            # Adaptive silence window: short commands end fast
+            speech_duration = speech_count * block_dur
+            if speech_duration <= 1.5:
+                silence_needed = int(SILENCE_SHORT / block_dur)  # 0.4s
+            else:
+                silence_needed = int(SILENCE_LONG / block_dur)   # 1.0s
+
+            if has_speech and silence_count >= silence_needed:
+                break
+
+        stream.stop()
+        stream.close()
+        return np.concatenate(frames) if has_speech else None
     except Exception as e:
-        print(f"  [!] Device enumeration failed: {e}")
-    _mic_device_cache["index"] = None
-    return None
-
-
-def _open_input_stream(sd, max_seconds):
-    """Try device/rate/rate-fallback combos until one opens."""
-    dev = _pick_input_device()
-    tries = []
-    for rate in ([_MIC_RATE_CACHE["rate"]] if _MIC_RATE_CACHE["rate"] else
-                 [44100, 48000, 16000]):
-        for ch in (1, 2):
-            tries.append((rate, ch))
-    last = None
-    for rate, ch in tries:
-        block = int(rate * 0.1)
-        try:
-            stream = sd.InputStream(device=dev, samplerate=rate, channels=ch,
-                                    dtype="int16", blocksize=block)
-            stream.start()
-            _MIC_RATE_CACHE["rate"] = rate
-            return stream, rate, ch, block
-        except Exception as e:
-            last = e
-            continue
-    print(f"  [!] No working input config: {last}")
-    return None, None, None, None
-
-
-def record_audio(max_seconds=10, pre_roll=0.0):
-    """
-    Returns int16 mono numpy array, or None if nothing above the noise floor.
-    Records until 1 s of silence after speech, or max_seconds.
-    """
-    import sounddevice as sd
-    with _mic_lock:                              # ← only one listener at a time
-        stream, rate, ch, block = _open_input_stream(sd, max_seconds)
-        if stream is None:
-            return None
-        frames, noise, has_speech, quiet = [], [], False, 0
-        need_quiet = 10                          # 10 x 0.1 s = 1 s of silence
-        try:
-            for i in range(int(max_seconds / 0.1)):
-                data, overflowed = stream.read(block)
-                mono = data[:, 0] if data.ndim > 1 else data.flatten()
-                frames.append(mono.copy())
-                rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
-
-                if i < MIC_CALIBRATE_BLOCKS:     # learn the room noise
-                    noise.append(rms)
-                    continue
-
-                floor = max(SILENCE_THRESHOLD_FLOOR,
-                            (sum(noise) / max(len(noise), 1)) * 2.5 + 40)
-                if rms > floor:
-                    has_speech = True
-                    quiet = 0
-                elif has_speech:
-                    quiet += 1
-                    if quiet >= need_quiet:
-                        break
-            return np.concatenate(frames) if has_speech else None
-        except Exception as e:
-            print(f"  [!] Recording error: {e}")
-            return None
-        finally:
-            try:
-                stream.stop()
-                stream.close()                   # ← was skipped on exceptions
-            except Exception:
-                pass
-
-
-def drain_mic(seconds=0.25):
-    """Throw away whatever is sitting in the mic buffer (our own TTS echo)."""
-    try:
-        import sounddevice as sd
-        dev, rate = _pick_input_device(), _MIC_RATE_CACHE["rate"] or 44100
-        with sd.InputStream(device=dev, samplerate=rate, channels=1,
-                            dtype="int16") as s:
-            end = time.time() + seconds
-            while time.time() < end:
-                s.read(int(rate * 0.05))
-    except Exception:
-        pass
+        print(f"  [!] Recording error: {e}")
+        return None
 
 
 def audio_to_wav_bytes(audio):
-    rate = _MIC_RATE_CACHE.get("rate") or 44100
-    if rate != 16000:
-        ratio = 16000 / rate
+    if MIC_SAMPLE_RATE != 16000:
+        ratio = 16000 / MIC_SAMPLE_RATE
         new_len = int(len(audio) * ratio)
         indices = np.linspace(0, len(audio) - 1, new_len).astype(int)
         audio = audio[indices]
@@ -1174,7 +1259,6 @@ except ImportError:
     print("  [!] speech_recognition not installed")
 
 _stt_fail_streak = {"n": 0}
-
 
 def transcribe(audio):
     if _sr_module is None:
@@ -1206,8 +1290,8 @@ def transcribe(audio):
 def listen(prompt=None, timeout=MAX_RECORD_SECONDS):
     if prompt:
         speak(prompt)
-    wait_for_tts()          # ← don't open the mic while we are still talking
-    drain_mic(0.25)         # ← discard buffered echo
+    wait_for_tts()
+    drain_mic()
     print("  [*] Listening...")
     audio = record_audio(max_seconds=timeout)
     if audio is None:
@@ -1220,9 +1304,6 @@ def listen(prompt=None, timeout=MAX_RECORD_SECONDS):
     return text
 
 recognize_speech = listen
-
-
-
 # ---- Continuous action control --------------------------------------------
 _continuous_action = {
     "running": False,
@@ -1704,18 +1785,30 @@ Translated:"""
 _vision_cache = {}
 
 
+_detected_vision_model = None
+
 def vision_model_ok():
+    """Detect installed moondream or llava variant dynamically."""
+    global _detected_vision_model
     now = time.time()
     if _vision_ok_cache["val"] is not None and now - _vision_ok_cache["time"] < 30:
         return _vision_ok_cache["val"]
+
+    val = False
     try:
         import requests
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
         models = r.json().get("models", [])
-        val = any("moondream" in m.get("name", "") or "llava" in m.get("name", "")
-                   for m in models)
+        for m in models:
+            name = m.get("name", "")
+            if "moondream" in name or "llava" in name or "bakllava" in name:
+                _detected_vision_model = name
+                val = True
+                print(f"  [Vision] Using model: {name}")
+                break
     except Exception:
         val = False
+
     _vision_ok_cache["val"] = val
     _vision_ok_cache["time"] = now
     return val
@@ -1791,7 +1884,7 @@ def find_image_on_screen(description):
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
-                "model": OLLAMA_VISION_MODEL,
+                "model": _detected_vision_model or OLLAMA_VISION_MODEL,
                 "prompt": prompt,
                 "images": [img_b64],
                 "stream": False,
@@ -1867,13 +1960,18 @@ except ImportError:
     print("  [!] winocr not installed - screen text reading disabled")
 
 _ocr_cache = {"words": None, "time": 0}
+_ocr_loop = None
 OCR_CACHE_SECONDS = 1.5
 
-def ocr_screen(force=False):
-    """OCR with Redis + memory cache."""
-    now = time.time()
+def _get_ocr_loop():
+    """Reusable event loop for winocr — avoids 'event loop closed' warnings."""
+    global _ocr_loop
+    if _ocr_loop is None or _ocr_loop.is_closed():
+        _ocr_loop = asyncio.new_event_loop()
+    return _ocr_loop
 
-    # Memory cache (fastest)
+def ocr_screen(force=False):
+    now = time.time()
     if (not force and _ocr_cache["words"] is not None
             and now - _ocr_cache["time"] < OCR_CACHE_SECONDS):
         return _ocr_cache["words"]
@@ -1892,9 +1990,13 @@ def ocr_screen(force=False):
     words = []
     if not _WINOCR_AVAILABLE:
         return words
+
     try:
         screenshot = pyautogui.screenshot()
-        result = asyncio.run(_winocr_module.recognize_pil(screenshot, lang="en"))
+        loop = _get_ocr_loop()
+        result = loop.run_until_complete(
+            _winocr_module.recognize_pil(screenshot, lang="en")
+        )
         for line in result.lines:
             for w in line.words:
                 bb = w.bounding_rect
@@ -1909,7 +2011,6 @@ def ocr_screen(force=False):
     except Exception as e:
         print(f"  [!] OCR error: {e}")
 
-    # Store in both caches
     _ocr_cache["words"] = words
     _ocr_cache["time"] = now
 
@@ -1919,8 +2020,6 @@ def ocr_screen(force=False):
         redis_set(rkey, words, ttl=10)
 
     return words
-
-
 def find_on_screen(target, occurrence=1, prefer_region=None, force_ocr=False):
     words = ocr_screen(force=force_ocr)        # ← fresh OCR when requested
     if not words:
@@ -3097,10 +3196,45 @@ def safe_last_resort(normalized_text, raw_text):
     return {"action": "click_word", "target": clean, "occurrence": 1}
 
 
+
+def extract_repeat(text):
+    """Detect if command has a repeat suffix, e.g. 'scroll down 3 times', 'five times', 'twice'."""
+    m_adv = re.search(r"\b(twice|thrice)\s*$", text)
+    if m_adv:
+        count = 2 if m_adv.group(1) == "twice" else 3
+        cleaned = text[:m_adv.start()].strip()
+        return cleaned, count
+    m = re.search(r"\b([a-z0-9]+)\s+times?$", text)
+    if m:
+        num_str = m.group(1)
+        if num_str.isdigit():
+            count = int(num_str)
+        else:
+            val = parse_number_words(num_str)
+            count = val if val is not None else 1
+        if count > 1:
+            cleaned = text[:m.start()].strip()
+            return cleaned, count
+    return text, 1
+
 def parse_command(text, use_fallback=True):
     debug_log(f"parse_command input: '{text}'")
-    t = normalize_command(text)
-    debug_log(f"after normalize: '{t}'")
+    text_norm = normalize_command(text)
+    debug_log(f"after normalize: '{text_norm}'")
+    original = text_norm.lower().strip()
+    t, repeat = extract_repeat(original)
+    intent = _parse_command_impl(t, text=text, use_fallback=use_fallback)
+    if intent and isinstance(intent, dict) and repeat > 1:
+        intent["repeat"] = repeat
+    return intent
+
+def _parse_command_impl(t, text=None, use_fallback=True):
+    if text is None:
+        text = t
+    repeat = 1
+
+    def wrap(intent):
+        return intent
 
     # ---- Multi-step command detection (FIRST PRIORITY) ----
     if use_fallback and is_multi_step_command(text):
@@ -3328,6 +3462,8 @@ def parse_command(text, use_fallback=True):
                     "occurrence": "all"}
 
     # "minimize this" / "minimize this window" / "minimize current"
+    if "minimize this window" in t or "minimize this" in t:
+        return {"action": "minimize_current"}
     if re.search(r"minimize\s+(this|current|it|now)(\s+window)?$", t) or t.strip() == "minimize":
         return {"action": "minimize_current", "target": ""}
 
@@ -3391,22 +3527,44 @@ def parse_command(text, use_fallback=True):
                 num = ORDINALS.get(ord_word) or (int(ord_word) if ord_word.isdigit() else 1)
             return {"action": "focus_window", "target": name, "occurrence": num}
 
-    # ---- Smart Open (context-aware) ----
-    # "open chrome" -> launches Chrome
-    # "open youtube" -> opens youtube.com in browser
-    # "open my downloads folder" (in Explorer) -> searches Explorer
-    # "open [anything else]" -> smart context handling
-    for pat in [r"(?:please\s+)?(?:can you\s+)?(?:open|launch|start|run)\s+(.+)"]:
+    # ---- Open app (strict: must START with open/launch verb) ----
+    for pat in [r"^(?:open|launch|start|run|execute)\s+(.+)$",
+                r"^(?:can you |please )?(?:open|launch|start)\s+(.+)$"]:
         m = re.match(pat, t)
         if m:
-            target = m.group(1).strip().rstrip(".")
+            app = m.group(1).strip().rstrip(".")
+            # DON'T match if the phrase contains "in" or "for" or "about"
+            if any(kw in app for kw in [" in ", " for ", " about ",
+                                          " on ", " of ", " with "]):
+                break
             # Skip tab commands (handled above)
-            if re.match(r"tab\s+\w+", target) or re.match(r"(?:the\s+)?\w+\s+tab$", target):
+            if re.match(r"tab\s+\w+", app) or re.match(r"(?:the\s+)?\w+\s+tab$", app):
                 continue
             # Skip account commands (handled above)
-            if "account" in target and "chrome" in target:
+            if "account" in app and "chrome" in app:
                 continue
-            return {"action": "smart_open", "target": target}
+            if app in APP_MAP:
+                return wrap({"action": "open_app", "target": app})
+            # Fuzzy match ONLY if it's a short phrase (<=3 words)
+            if len(app.split()) <= 3:
+                for key in APP_MAP:
+                    if key == app or (len(key) > 3 and
+                                       (key in app or app in key)):
+                        return wrap({"action": "open_app", "target": key})
+            # No fuzzy match for longer phrases - treat as unknown
+            if len(app.split()) <= 2:
+                return wrap({"action": "open_app", "target": app})
+
+    # "search cats in chrome" / "find X in Y" should go to search
+    m_search_in = re.match(r"^(?:search|find|look up|google)\s+(.+?)\s+in\s+(.+)$", t)
+    if m_search_in:
+        s_query = m_search_in.group(1).strip()
+        s_where = m_search_in.group(2).strip()
+        if s_where in APP_MAP:
+            open_app(s_where)
+            time.sleep(1.5)
+            return wrap({"action": "search", "target": s_query})
+        return wrap({"action": "search", "target": s_query})
 
     # Bare app name
     if t in APP_MAP:
@@ -3591,6 +3749,15 @@ def parse_command(text, use_fallback=True):
         if not re.search(r"\b(on|button|word|text|link)\b", combo):
             return {"action": "press_key_repeat", "target": combo, "times": times}
     
+    # 15. Keys (multi-word aware)
+    m = re.match(r"(?:press|hit|tap)\s+(?:the\s+)?(.+?)(?:\s+key)?$", t)
+    if m:
+        key_phrase = m.group(1).strip()
+        if (key_phrase in _KEY_ALIASES or
+            key_phrase.replace(" ", "") in pyautogui.KEYBOARD_KEYS or
+            "+" in key_phrase):
+            return wrap({"action": "press_key", "target": key_phrase})
+
     # "press ctrl shift s" / "press win x" / "hit alt f4" / "press c"
     key_match = re.search(
         r"(?:press|hit|tap|push|type)\s+(?:the\s+)?(?:key\s+)?(.+)", t)
@@ -3686,6 +3853,26 @@ def parse_command(text, use_fallback=True):
     if "maximize" in t:     return {"action": "maximize_current", "target": ""}
     if "screenshot" in t:   return {"action": "screenshot", "target": ""}
     if "new tab" in t:      return {"action": "new_tab", "target": ""}
+
+    # ---- Keyboard keys (multi-word aware) ----
+    m = re.match(r"(?:press|hit|tap)\s+(?:the\s+)?(.+?)(?:\s+key)?$", t)
+    if m:
+        key_phrase = m.group(1).strip()
+        if (key_phrase in _KEY_ALIASES or
+            key_phrase.replace(" ", "") in pyautogui.KEYBOARD_KEYS or
+            "+" in key_phrase):
+            return wrap({"action": "press_key", "target": key_phrase})
+
+    if t in ("enter", "press enter", "return", "confirm", "ok", "okay"):
+        return wrap({"action": "press_key", "target": "enter"})
+    if t in ("escape", "esc", "press escape", "cancel"):
+        return wrap({"action": "press_key", "target": "escape"})
+    if t == "tab" or "press tab" in t:
+        return wrap({"action": "press_key", "target": "tab"})
+    if t in ("page down", "pagedown"):
+        return wrap({"action": "press_key", "target": "pagedown"})
+    if t in ("page up", "pageup"):
+        return wrap({"action": "press_key", "target": "pageup"})
 
     # Expanded bare words:
     if t.strip() in ("enter", "confirm", "ok", "okay", "submit"):
@@ -4101,6 +4288,49 @@ def screenshot():
 # ---- Universal Key Press System -------------------------------------------
 
 # Map spoken key names to pyautogui key names
+
+# ---- Key name normalization (handles multi-word keys) ---------------------
+_KEY_ALIASES = {
+    "page down": "pagedown", "page up": "pageup",
+    "caps lock": "capslock", "num lock": "numlock",
+    "scroll lock": "scrolllock", "print screen": "printscreen",
+    "left arrow": "left", "right arrow": "right",
+    "up arrow": "up", "down arrow": "down",
+    "space bar": "space", "spacebar": "space",
+    "back space": "backspace", "back-space": "backspace",
+    "return": "enter", "esc": "escape",
+    "delete key": "delete", "del": "delete",
+    "windows key": "win", "win key": "win",
+    "control": "ctrl", "ctrl key": "ctrl",
+    "alt key": "alt", "shift key": "shift",
+    "function 1": "f1", "function 2": "f2", "function 3": "f3",
+    "function 4": "f4", "function 5": "f5", "function 6": "f6",
+    "function 7": "f7", "function 8": "f8", "function 9": "f9",
+    "function 10": "f10", "function 11": "f11", "function 12": "f12",
+}
+
+def normalize_key_name(name):
+    """Convert spoken key names to pyautogui-compatible keys."""
+    n = name.lower().strip()
+    if n in _KEY_ALIASES:
+        return _KEY_ALIASES[n]
+    joined = n.replace(" ", "")
+    if joined in pyautogui.KEYBOARD_KEYS:
+        return joined
+    return n
+
+def press_key(key_name):
+    """Press one key, or a combo like 'ctrl+shift+t'."""
+    key_name = key_name.strip()
+    if "+" in key_name:
+        parts = [normalize_key_name(p) for p in key_name.split("+")]
+        speak(f"Pressing {'+'.join(parts)}")
+        pyautogui.hotkey(*parts)
+    else:
+        normalized = normalize_key_name(key_name)
+        speak(f"Key {normalized}")
+        pyautogui.press(normalized)
+
 KEY_NAME_MAP = {
     # Letters (a-z handled automatically)
     # Numbers (0-9 handled automatically)
@@ -4308,9 +4538,10 @@ def hold_key(key_name, duration=2):
 def execute(intent):
     action = intent.get("action", "")
     target = intent.get("target", "")
+    repeat = intent.get("repeat", 1)
 
     # LOG every action for debugging
-    print(f"  [EXECUTE] action='{action}' target='{target}' intent={intent}")
+    print(f"  [EXECUTE] action='{action}' target='{target}' repeat={repeat} intent={intent}")
 
     # Handle multi-step plans separately
     if action == "execute_plan":
@@ -4373,6 +4604,7 @@ def execute(intent):
         "close_app":    close_win,
         "close_tab":    close_tab,
         "new_tab":      new_tab,
+        "press_key": lambda: press_key(target),
         "press_key_combo":  lambda: press_key_combo(target),
         "press_key_repeat": lambda: press_key_repeat(target, intent.get("times", 1)),
         "hold_key":         lambda: hold_key(target, intent.get("duration", 2)),
@@ -4385,7 +4617,10 @@ def execute(intent):
 
     fn = action_map.get(action)
     if fn:
-        fn()
+        for _ in range(max(1, int(repeat))):
+            fn()
+            if repeat > 1:
+                time.sleep(0.1)
     else:
         print(f"  [!] Unknown action: '{action}'")
         speak("I didn't understand that.")
@@ -4499,6 +4734,7 @@ def main():
     banner()
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0.02
+    calibrate_noise_floor()
 
     try:
         load_translations()

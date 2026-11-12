@@ -789,7 +789,7 @@ def _is_fuzzy_wake_token(tok):
         return False
     return _wake_ratio(tok) >= 0.78
 
-AUTO_SLEEP_TIMEOUT = 120  # seconds of inactivity before auto-sleep
+AUTO_SLEEP_TIMEOUT = 300  # seconds of silence before auto-sleep (0 = never). Was 120.
 
 APP_MAP = {
     "chrome":          ("start", "chrome"),
@@ -1191,7 +1191,7 @@ def transcribe(audio):
     rec.non_speaking_duration = 0.4
     data = _sr_module.AudioData(wav, 16000, 2)
     try:
-        text = rec.recognize_google(data)
+        text = rec.recognize_google(data, language=STT_LANGUAGE)
         _stt_fail_streak["n"] = 0
         return text.lower().strip()
     except _sr_module.UnknownValueError:
@@ -2209,13 +2209,23 @@ def get_foreground_window_info():
         return "", "", ""
 
 
+# STT language: en-IN (Indian English) recognizes the wake word and commands
+# far better for Indian-accented speakers; change to "en-US"/"en-GB" if needed.
+STT_LANGUAGE = "en-IN"
+
+import socket
+socket.setdefaulttimeout(12)  # no network call (incl. Google STT) may hang forever
+
+
 def get_auto_sleep_timeout():
+    if AUTO_SLEEP_TIMEOUT <= 0:
+        return 0
     try:
         cls, title, proc = get_foreground_window_info()
         media_apps = ["vlc", "chrome", "msedge", "firefox", "spotify",
                       "brave", "opera", "mpv", "mpc-hc"]
         if any(m in proc for m in media_apps):
-            return 300
+            return max(AUTO_SLEEP_TIMEOUT, 600)  # browser/media: at least 10 min
     except Exception:
         pass
     return AUTO_SLEEP_TIMEOUT
@@ -4367,10 +4377,11 @@ def main():
                 if cmd and len(cmd.strip()) >= 1:
                     print(f"  [Wake+Command] \"{cmd}\"")
                     try:
+                        t_exec = time.time()
                         intent = parse_command(cmd)
-                        if intent.get("action") != "unknown":
-                            last_command_time = time.time()
+                        last_command_time = time.time()   # any speech resets the timer
                         execute(intent)
+                        print(f"  [*] Command handled in {time.time()-t_exec:.1f}s")
                     except Exception as e:
                         print(f"  [!] Error executing wake command: {e}")
                         speak("Error running that")
@@ -4387,17 +4398,20 @@ def main():
                 print("\n  [ACTIVE] Listening for command...")
                 text = listen(timeout=15)
 
+                sleep_timeout = get_auto_sleep_timeout()
                 if not text:
-                    if time.time() - last_command_time > get_auto_sleep_timeout():
+                    if sleep_timeout and time.time() - last_command_time > sleep_timeout:
                         active = False
                         speak("Going to sleep due to inactivity.")
                         print("  [SLEEP] Auto-sleep due to inactivity")
-                    else:
-                        remaining = int(get_auto_sleep_timeout() - (time.time() - last_command_time))
+                    elif sleep_timeout:
+                        remaining = int(sleep_timeout - (time.time() - last_command_time))
                         print(f"  [...] Silence. Still active. (Auto-sleep in {max(0, remaining)}s)")
+                    else:
+                        print("  [...] Silence. Still active (auto-sleep disabled).")
                     continue
 
-                if time.time() - last_command_time > get_auto_sleep_timeout():
+                if sleep_timeout and time.time() - last_command_time > sleep_timeout:
                     active = False
                     speak("Going to sleep.")
                     print("  [SLEEP] Inactivity timeout expired")
@@ -4445,12 +4459,12 @@ def main():
                         last_command_time = time.time()
                         continue
 
+                t_exec = time.time()
                 intent = parse_command(text)
-
-                if intent.get("action") != "unknown":
-                    last_command_time = time.time()
+                last_command_time = time.time()   # any speech resets the timer
 
                 execute(intent)
+                print(f"  [*] Command handled in {time.time()-t_exec:.1f}s")
 
         except KeyboardInterrupt:
             print("\n  [Interrupt] Shutting down...")

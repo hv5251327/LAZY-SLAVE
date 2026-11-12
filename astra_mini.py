@@ -61,6 +61,12 @@
 import os
 import sys
 import time
+
+# Printed BEFORE any heavy third-party import, so the console shows life
+# immediately instead of sitting blank while numpy/pyautogui load.
+print("ROLEX - starting...", flush=True)
+_T_START = time.time()
+
 import json
 import subprocess
 import threading
@@ -70,14 +76,61 @@ import asyncio
 import re
 import base64
 import urllib.parse
+import hashlib
 from difflib import SequenceMatcher
 from functools import lru_cache
 
-import numpy as np
+
+class _LazyModule:
+    """Import-on-first-use proxy for heavy third-party modules.
+
+    'pyautogui.click(...)' anywhere in the file works unchanged,
+    but the import (often 1-2s on Windows) happens only when first
+    needed - or in the background prewarm thread at startup.
+    """
+
+    def __init__(self, name, after_load=None):
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_m", None)
+        object.__setattr__(self, "_after_load", after_load)
+
+    def _load(self):
+        m = object.__getattribute__(self, "_m")
+        if m is None:
+            name = object.__getattribute__(self, "_name")
+            import importlib
+            m = importlib.import_module(name)
+            after = object.__getattribute__(self, "_after_load")
+            if after is not None:
+                try:
+                    after(m)
+                except Exception:
+                    pass
+            object.__setattr__(self, "_m", m)
+        return m
+
+    def __getattr__(self, item):
+        return getattr(self._load(), item)
+
+    def __setattr__(self, key, value):
+        if key.startswith("_"):
+            object.__setattr__(self, key, value)
+        else:
+            setattr(self._load(), key, value)
+
+
+def _setup_pyautogui(m):
+    m.FAILSAFE = True
+    m.PAUSE = 0.02
+
+
+np = _LazyModule("numpy")
+pyttsx3 = _LazyModule("pyttsx3")
+pyautogui = _LazyModule("pyautogui", _setup_pyautogui)
 import sounddevice as sd
-import pyttsx3
-import pyautogui
 from PIL import Image
+
+print(f"[*] Core imports: {time.time() - _T_START:.1f}s")
 
 if sys.platform == "win32":
     try:
@@ -787,23 +840,30 @@ ORDINALS = {
 }
 
 # =============================================================
-#  Redis cache (optional) + screenshot hash (ONE screenshot reused)
+#  Redis cache (optional) - initialized in a BACKGROUND thread so startup
+#  never blocks on it; functions see _REDIS_AVAILABLE flip when ready
 # =============================================================
-try:
-    import redis
-    import hashlib
+_redis_client = None
+_REDIS_AVAILABLE = False
 
-    _redis_client = redis.Redis(
-        host="localhost", port=6379, db=0,
-        decode_responses=False, socket_timeout=2, socket_connect_timeout=2,
-    )
-    _redis_client.ping()
-    _REDIS_AVAILABLE = True
-    print("  [OK] Redis connected - vision caching enabled")
-except Exception as _e:
-    _redis_client = None
-    _REDIS_AVAILABLE = False
-    print(f"  [!] Redis not available ({_e}) - using memory cache")
+
+def _redis_init():
+    global _redis_client, _REDIS_AVAILABLE
+    try:
+        import redis
+        client = redis.Redis(
+            host="localhost", port=6379, db=0,
+            decode_responses=False,
+            socket_timeout=0.5, socket_connect_timeout=0.5,
+        )
+        client.ping()
+        _redis_client = client
+        _REDIS_AVAILABLE = True
+        print("  [OK] Redis connected - caching enabled")
+    except Exception as _e:
+        _redis_client = None
+        _REDIS_AVAILABLE = False
+        print(f"  [..] Redis not available - using memory cache")
 
 
 def _thumb_hash_from_image(img):
@@ -907,10 +967,14 @@ SILENCE_LONG  = 0.8    # longer commands
 
 
 def _to_mono(data):
-    """Average all channels. Laptop mic arrays often have a dead ch0."""
+    """Average all channels to mono.
+
+    Laptop mic arrays often have a dead ch0.  ALWAYS returns int16 -
+    the WAV writer declares 2 bytes/sample, so anything else corrupts it.
+    """
     if data.ndim > 1:
-        return data.mean(axis=1)
-    return data.flatten()
+        return data.mean(axis=1).astype(np.int16)
+    return data.flatten().astype(np.int16)
 
 
 def calibrate_noise_floor(seconds=0.45):
@@ -1058,9 +1122,10 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
         stream.start()
         for _ in range(max_blocks):
             data, _ = stream.read(block_size)
-            mono = _to_mono(data).astype(np.float32)
-            frames.append(mono.copy())
-            rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
+            mono_i16 = _to_mono(data)          # always int16
+            frames.append(mono_i16.copy())
+            mono = mono_i16.astype(np.float32)
+            rms = float(np.sqrt(np.mean(mono ** 2)))
 
             if rms > threshold:
                 has_speech = True
@@ -1087,6 +1152,10 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
 
 
 def audio_to_wav_bytes(audio):
+    # Guarantee int16 mono - a mismatch here silently breaks STT
+    audio = np.asarray(audio)
+    if audio.dtype != np.int16:
+        audio = np.clip(audio.astype(np.float32), -32768, 32767).astype(np.int16)
     if MIC_SAMPLE_RATE != 16000:
         ratio = 16000 / MIC_SAMPLE_RATE
         new_len = int(len(audio) * ratio)
@@ -1146,12 +1215,20 @@ def listen(prompt=None, timeout=MAX_RECORD_SECONDS):
     t0 = time.time()
     audio = record_audio(max_seconds=timeout)
     if audio is None:
-        print("  [..] No speech detected")
+        print("  [..] No speech detected (mic too quiet? see [Mic] line, "
+              "raise Windows input volume or move closer)")
         return None
-    print(f"  [*] Recognizing... ({time.time()-t0:.1f}s audio)")
+    peak = int(np.abs(audio.astype(np.float32)).max())
+    rms = int(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+    print(f"  [*] Recognizing... ({time.time()-t0:.1f}s audio, peak={peak}, rms={rms})")
+    if peak < 250:
+        print("  [!] Very low signal - increase mic volume in Windows sound settings")
     text = transcribe(audio)
     if text:
         print(f"  [Heard] \"{text}\"  ({time.time()-t0:.1f}s total)")
+    else:
+        print(f"  [..] STT returned nothing (internet needed for Google STT). "
+              f"Recorded {len(audio)/MIC_SAMPLE_RATE:.1f}s @ peak={peak}")
     return text
 
 
@@ -4159,8 +4236,25 @@ BANNER = r"""
 """
 
 
+def _prewarm():
+    """Background warm-up: heavy imports happen OFF the startup path."""
+    try:
+        _ = (pyautogui.FAILSAFE, np.float32)   # forces both modules to import
+        print(f"[*] Libraries ready: {time.time() - _T_START:.1f}s (background)")
+    except Exception:
+        pass
+    try:
+        _redis_init()
+    except Exception:
+        pass
+    try:
+        if ENABLE_LLM:
+            ollama_ok()
+    except Exception:
+        pass
+
+
 def banner():
-    os.system("cls" if os.name == "nt" else "clear")
     print(BANNER)
 
 
@@ -4222,24 +4316,17 @@ def run_selftest():
 
 def main():
     t_start = time.time()
+    threading.Thread(target=_prewarm, daemon=True).start()   # imports/redis/ollama in background
     banner()
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.02
 
-    # Ollama check runs in the BACKGROUND - waking must never wait for it
-    if ENABLE_LLM:
-        threading.Thread(target=ollama_ok, daemon=True).start()
-
-    calibrate_noise_floor()
+    calibrate_noise_floor(0.3)
 
     try:
         load_translations()
     except Exception:
         pass
 
-    if _REDIS_AVAILABLE:
-        print("  [OK] Redis caching enabled")
-    print(f"  [*] Startup: {time.time() - t_start:.1f}s - mic is armed")
+    print(f"  [*] Ready in {time.time() - t_start:.1f}s - mic is armed")
     print()
 
     speak("Rolex ready.")

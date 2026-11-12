@@ -715,6 +715,27 @@ OLLAMA_VISION_MODEL = "moondream:1.8b"
 WAKE_WORDS = ["rolex", "hey rolex", "rolex mini", "rollex", "rolax",
               "rolix", "rollix", "rolexx"]
 
+# Google STT mishears of "Rolex" - covered explicitly, plus a fuzzy rule below
+WAKE_MISHEAR = [
+    "relax", "relaxes", "rolexs", "roles", "rollx", "rolux", "robex",
+    "relex", "rolaks", "rowlex", "roliks", "rolyx", "rolik", "rolers",
+    "rolexx", "rolexy", "rolex on", "role x", "roll eggs", "raul x",
+]
+
+
+def _wake_ratio(tok):
+    return SequenceMatcher(None, tok, "rolex").ratio()
+
+
+def _is_fuzzy_wake_token(tok):
+    """'relax', 'rolaks'... start with r, 4-8 chars, close to 'rolex'."""
+    tok = tok.strip(".,!?;:'")
+    if not (4 <= len(tok) <= 8):
+        return False
+    if not tok.startswith("r"):
+        return False
+    return _wake_ratio(tok) >= 0.78
+
 AUTO_SLEEP_TIMEOUT = 120  # seconds of inactivity before auto-sleep
 
 APP_MAP = {
@@ -863,11 +884,13 @@ def get_mic_settings():
     try:
         dev_idx = sd.default.device[0]
         if dev_idx < 0:
+            print("  [Mic] No default input device! Check Windows sound settings.")
             return 1, 44100, 0
         info = sd.query_devices(dev_idx)
         ch = min(int(info["max_input_channels"]), 2)
         sr = int(info["default_samplerate"])
-        print(f"  [Mic] {info['name']} ({ch}ch @ {sr}Hz)")
+        print(f"  [Mic] #{dev_idx}: {info['name']} ({ch}ch @ {sr}Hz)")
+        print("  [Mic] If 'Rolex' never wakes, set THIS device as default in Windows sound settings.")
         return max(ch, 1), sr, dev_idx
     except Exception as e:
         print(f"  [!] Mic error: {e}")
@@ -877,13 +900,20 @@ def get_mic_settings():
 MIC_CHANNELS, MIC_SAMPLE_RATE, MIC_DEVICE_IDX = get_mic_settings()
 
 NOISE_FLOOR = 300
-SILENCE_MULT = 1.6
+SILENCE_MULT = 1.4        # was 1.6 - wakes on quieter speech
 MAX_RECORD_SECONDS = 10
-SILENCE_SHORT = 0.35   # quick commands end fast       (was 0.4)
-SILENCE_LONG  = 0.8    # longer commands                (was 1.0)
+SILENCE_SHORT = 0.35   # quick commands end fast
+SILENCE_LONG  = 0.8    # longer commands
 
 
-def calibrate_noise_floor(seconds=0.6):
+def _to_mono(data):
+    """Average all channels. Laptop mic arrays often have a dead ch0."""
+    if data.ndim > 1:
+        return data.mean(axis=1)
+    return data.flatten()
+
+
+def calibrate_noise_floor(seconds=0.45):
     global NOISE_FLOOR
     try:
         print(f"  [*] Calibrating noise floor ({seconds}s)...")
@@ -891,9 +921,9 @@ def calibrate_noise_floor(seconds=0.6):
         data = sd.rec(samples, samplerate=MIC_SAMPLE_RATE,
                       channels=MIC_CHANNELS, dtype="int16")
         sd.wait()
-        mono = data[:, 0] if data.ndim > 1 else data.flatten()
-        rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
-        NOISE_FLOOR = max(150, int(rms * 1.2))
+        mono = _to_mono(data).astype(np.float32)
+        rms = float(np.sqrt(np.mean(mono ** 2)))
+        NOISE_FLOOR = min(1500, max(80, int(rms * 1.15)))
         print(f"  [*] Noise floor: {NOISE_FLOOR}")
     except Exception as e:
         print(f"  [!] Calibration failed, using default: {e}")
@@ -901,7 +931,7 @@ def calibrate_noise_floor(seconds=0.6):
 
 def drain_mic():
     try:
-        sd.rec(int(MIC_SAMPLE_RATE * 0.08),
+        sd.rec(int(MIC_SAMPLE_RATE * 0.05),
                samplerate=MIC_SAMPLE_RATE,
                channels=MIC_CHANNELS, dtype="int16")
         sd.wait()
@@ -918,7 +948,9 @@ import queue as _queue
 _speech_queue = _queue.Queue()
 _speech_thread = None
 _speech_lock = threading.Lock()
-_tts_speaking = threading.Event()   # set while the engine is actually speaking
+_tts_pending = 0                     # number of utterances still being spoken
+_tts_idle = threading.Event()        # set when nothing is speaking
+_tts_idle.set()
 
 
 def _speech_worker():
@@ -939,6 +971,8 @@ def _speech_worker():
         local_engine.setProperty("volume", 0.9)
     except Exception as e:
         print(f"  [!] TTS worker init failed: {e}")
+        with _speech_lock:
+            _tts_idle.set()          # never leave callers blocked on wait_for_tts
         return
 
     while True:
@@ -947,13 +981,17 @@ def _speech_worker():
             if text is None:
                 break
             try:
-                _tts_speaking.set()
                 local_engine.say(text)
                 local_engine.runAndWait()
             except Exception as e:
                 print(f"  [!] TTS error: {e}")
             finally:
-                _tts_speaking.clear()
+                with _speech_lock:
+                    global _tts_pending
+                    _tts_pending -= 1
+                    if _tts_pending <= 0:
+                        _tts_pending = 0
+                        _tts_idle.set()
         except _queue.Empty:
             continue
 
@@ -962,7 +1000,8 @@ def _speech_worker():
     except Exception:
         pass
     finally:
-        _tts_speaking.clear()
+        with _speech_lock:
+            _tts_idle.set()
 
 
 def _ensure_speech_thread():
@@ -975,7 +1014,11 @@ def _ensure_speech_thread():
 
 def speak(text, wait=False):
     print(f"  [Rolex] {text}")
+    global _tts_pending
     _ensure_speech_thread()
+    with _speech_lock:
+        _tts_pending += 1
+        _tts_idle.clear()
     _speech_queue.put(text)
     if wait:
         wait_for_tts()
@@ -984,17 +1027,9 @@ def speak(text, wait=False):
 def wait_for_tts(timeout=10.0):
     """Block until the engine has FINISHED speaking (not just drained queue)."""
     end = time.time() + timeout
-    # Wait for speech to start (it may still be queued)
-    start_deadline = time.time() + 0.5
-    while time.time() < start_deadline:
-        if _tts_speaking.is_set() or _speech_queue.empty():
-            break
-        time.sleep(0.02)
-    # Then wait for it to finish
-    while _tts_speaking.is_set():
+    while not _tts_idle.wait(0.05):
         if time.time() > end:
             return False
-        time.sleep(0.05)
     return True
 
 
@@ -1013,7 +1048,7 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
     block_size = int(MIC_SAMPLE_RATE * block_dur)
     max_blocks = int(max_seconds / block_dur)
 
-    threshold = max(NOISE_FLOOR * SILENCE_MULT, 300)
+    threshold = max(NOISE_FLOOR * SILENCE_MULT, 220)
 
     try:
         stream = sd.InputStream(
@@ -1023,7 +1058,7 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
         stream.start()
         for _ in range(max_blocks):
             data, _ = stream.read(block_size)
-            mono = data[:, 0] if data.ndim > 1 else data.flatten()
+            mono = _to_mono(data).astype(np.float32)
             frames.append(mono.copy())
             rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
 
@@ -1329,11 +1364,15 @@ SLEEP_PHRASES = [
 def has_wake(text):
     if not text:
         return False
-    t = text.lower().strip()
-    for w in WAKE_WORDS:
+    t = " ".join(text.lower().split())
+    for w in WAKE_WORDS + WAKE_MISHEAR:
         if re.search(r"\b" + re.escape(w) + r"\b", t):
             return True
         if t == w:
+            return True
+    # fuzzy fallback: any r-start token close enough to "rolex"
+    for tok in t.split():
+        if _is_fuzzy_wake_token(tok):
             return True
     return False
 
@@ -1342,7 +1381,7 @@ def strip_wake(text):
     if not text:
         return ""
     t = text.lower().strip()
-    sorted_wake = sorted(WAKE_WORDS, key=len, reverse=True)
+    sorted_wake = sorted(WAKE_WORDS + WAKE_MISHEAR, key=len, reverse=True)
 
     for w in sorted_wake:
         if t.startswith(w + " ") or t == w:
@@ -1364,6 +1403,13 @@ def strip_wake(text):
             new = re.sub(r"\s+", " ", new)
             new = new.strip(",.!?;: ")
             return new
+
+    # fuzzy fallback: drop r-start tokens that sound like "rolex"
+    fuzzy_hit = [tok for tok in t.split() if _is_fuzzy_wake_token(tok)]
+    if fuzzy_hit:
+        cleaned = " ".join(tok for tok in t.split() if not _is_fuzzy_wake_token(tok))
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(",.!?;: ")
+        return cleaned
 
     return t
 
@@ -2975,7 +3021,7 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             "google": "https://www.google.com", "github": "https://github.com",
             "maps": "https://maps.google.com", "facebook": "https://www.facebook.com",
             "twitter": "https://twitter.com", "x": "https://x.com",
-            "instagram": "https://www.instagram.com", "reddit": "https://www.reddit.com",
+            "instagram": "https://www.instagram.com", "reddit": "https://reddit.com",
             "wikipedia": "https://www.wikipedia.org",
         }
         if target in site_domains:
@@ -4175,9 +4221,15 @@ def run_selftest():
 
 
 def main():
+    t_start = time.time()
     banner()
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0.02
+
+    # Ollama check runs in the BACKGROUND - waking must never wait for it
+    if ENABLE_LLM:
+        threading.Thread(target=ollama_ok, daemon=True).start()
+
     calibrate_noise_floor()
 
     try:
@@ -4185,16 +4237,12 @@ def main():
     except Exception:
         pass
 
-    if ENABLE_LLM and ollama_ok():
-        print("  [OK] Ollama running - smart fallback ON (rarely needed)")
-    else:
-        print("  [!] Ollama offline/disabled - all local commands still work")
-
     if _REDIS_AVAILABLE:
         print("  [OK] Redis caching enabled")
+    print(f"  [*] Startup: {time.time() - t_start:.1f}s - mic is armed")
     print()
 
-    speak("Rolex ready. Say Rolex to wake me up.")
+    speak("Rolex ready.")
 
     active = False
     last_command_time = time.time()
@@ -4337,8 +4385,52 @@ def main():
             continue
 
 
+def run_waketest():
+    """No microphone needed: checks that wake-word detection works offline."""
+    cases = [
+        ("rolex", True), ("hey rolex", True), ("rolex open chrome", True),
+        ("relax", True), ("relax open chrome", True), ("roles open chrome", True),
+        ("rolaks", True), ("rowlex pause", True), ("relex", True),
+        ("rolex volume up", True), ("rolex scroll down", True),
+        ("hello", False), ("open chrome", False), ("chrome", False),
+        ("scroll down", False), ("notes", False), ("rocky horror", False),
+    ]
+    ok = True
+    print("\n  === Wake-word detection test ===\n")
+    for phrase, expected in cases:
+        got = has_wake(phrase)
+        mark = "ok " if got == expected else "FAIL"
+        if got != expected:
+            ok = False
+        print(f"  {mark}  {phrase:26s} -> wake={got} (expected {expected})")
+        if got == expected and got:
+            print(f"          stripped -> \"{strip_wake(phrase)}\"")
+    print("\n  " + ("ALL PASS" if ok else "SOME FAILED"))
+
+
+def run_listen_test():
+    """Microphone test: listens ONCE and shows exactly what STT heard."""
+    print("\n  === Mic / STT diagnostic ===")
+    calibrate_noise_floor()
+    print("\n  Say 'Rolex' (or a command) after the beep...")
+    speak("Listening")
+    text = listen(timeout=8)
+    print(f"\n  Transcript : {text!r}")
+    if text:
+        print(f"  Wake word  : {has_wake(text)}")
+        print(f"  Stripped   : {strip_wake(text)!r}")
+        print(f"  Intent     : {parse_command(strip_wake(text), use_fallback=False)}")
+    else:
+        print("  NOTHING heard - check the [Mic] line above, your default")
+        print("  input device, and that Windows sound input is not muted.")
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         run_selftest()
+    elif "--waketest" in sys.argv:
+        run_waketest()
+    elif "--listen" in sys.argv:
+        run_listen_test()
     else:
         main()

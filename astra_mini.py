@@ -1,8 +1,62 @@
-"""
- ===============================================
-  ASTRA MINI v3 - Voice-Controlled Screen Agent
- ===============================================
-"""
+# ===============================================
+#  ASTRA MINI v3.1 - ROLEX - Voice-Controlled Screen Agent (FIXED)
+# ===============================================
+#
+#  What was broken in the original and is fixed here:
+#
+#  1. DUPLICATE Win32 SENDINPUT BLOCK (the big one)
+#     The script defined MOUSEINPUT/INPUT_UNION/INPUT, reliable_click etc.
+#     TWICE. The second (mouse-only) block re-bound INPUT_UNION, so when
+#     _send_key() later did INPUT_UNION(ki=KEYBDINPUT(...)) it raised
+#     TypeError. Result: ALL volume keys (vol up/down/mute), media keys
+#     (play/pause/next/prev) silently died inside the main try/except.
+#     -> Fixed: ONE clean SendInput definition for mouse AND keyboard.
+#
+#  2. "move" COMMANDS NEVER MATCHED LOCALLY
+#     "move mouse to the right", "move the cursor left", "slide pointer
+#     down" etc. have words BETWEEN the verb and the direction, so the
+#     regex `move\s+(?:to\s+)?(?:the\s+)?(right|left|...)` never matched,
+#     and the command fell through to Ollama (15-20s, usually "unknown").
+#     -> Fixed: normalization collapses verb + mouse/cursor/pointer +
+#        optional to/towards into "move <direction>", and the move regex
+#        itself also tolerates the intervening words.
+#
+#  3. POLITE FILLERS WENT TO THE LLM
+#     "can you open chrome please", "please scroll down" did not match
+#     local rules -> Ollama translation -> seconds of latency.
+#     -> Fixed: leading ("please","can you","could you",...) and trailing
+#        ("please","for me","now") fillers are stripped up front.
+#
+#  4. QUESTIONS WERE SENT TO OLLAMA (expensive!)
+#     "what time is it", "how are you" etc. hit the 15-20s Ollama call.
+#     -> Fixed: question-words short-circuit to action="unknown" before
+#        the Ollama fallback. Ollama is now a true last resort only.
+#
+#  5. MORE LOCAL RULES SO THE LLM IS (ALMOST) NEVER NEEDED
+#     "go to <url/site>", "turn up/down the volume", "raise the volume",
+#     "shut down chrome" -> close chrome, "select all" stays intact,
+#     "select <word>" reaches the real Select action again (it was being
+#     swallowed by the click synonyms).
+#
+#  6. SLOW PER-TURN RESPONSE
+#     - Silence windows trimmed (0.4/1.0s -> 0.35/0.8s)
+#     - wait_for_tts() now waits for ACTUAL speech end (not queue drain),
+#       which also stops Rolex hearing its own voice through the mic.
+#     - Ollama timeouts reduced (translate 15->8s, planner 30->20s) and
+#       the translator prompt shrunk so even the fallback is faster.
+#     - OCR/vision take ONE screenshot instead of two.
+#
+#  7. Startup is quicker/quieter (single Win32 init, no double definitions,
+#     DEBUG_MODE off, mixed unused code removed).
+#
+#  NOTES:
+#  - Ollama is OPTIONAL. If it is offline, every local command still works
+#    and nothing slows down. Set ENABLE_LLM = False to ban the LLM entirely.
+#  - Needs: pyautogui SpeechRecognition sounddevice pyttsx3 Pillow numpy
+#           pywin32 pythoncom, winocr (Windows), psutil, redis (optional)
+#  - Ollama models (optional):  ollama pull qwen2.5:1.5b
+#                               ollama pull moondream:1.8b
+# ===============================================
 
 import os
 import sys
@@ -25,7 +79,6 @@ import pyttsx3
 import pyautogui
 from PIL import Image
 
-# Fix Windows console encoding
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -33,8 +86,19 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Set False to forbid ANY call to the local LLM (Ollama).
+ENABLE_LLM = True
 
-# ---- Win32 API with proper 64-bit signatures ------------------------------
+DEBUG_MODE = False
+
+def debug_log(msg):
+    if DEBUG_MODE:
+        print(f"  [DEBUG] {msg}")
+
+
+# =============================================================
+#  Win32 API - ONE definition, 64-bit safe
+# =============================================================
 try:
     import ctypes
     from ctypes import wintypes
@@ -46,45 +110,7 @@ try:
     except Exception:
         pass
 
-    # CRITICAL: Define argtypes/restype or 64-bit handles get truncated to 32-bit
-    _user32.GetForegroundWindow.restype = wintypes.HWND
-    _user32.GetForegroundWindow.argtypes = []
-
-    _user32.GetClassNameW.restype = ctypes.c_int
-    _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-
-    _user32.SetCursorPos.restype = wintypes.BOOL
-    _user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-
-    _user32.GetCursorPos.restype = wintypes.BOOL
-    _user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-
-    _user32.SendInput.restype = ctypes.c_uint
-    # argtypes set after INPUT struct is defined below
-
-    _user32.mouse_event.restype = None
-    _user32.mouse_event.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int,
-                                    ctypes.c_uint, ctypes.c_void_p]
-
-    # DPI awareness
-    try:
-        if _shcore:
-            _shcore.SetProcessDpiAwareness.restype = ctypes.c_long
-            _shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
-            _shcore.SetProcessDpiAwareness(2)
-            print("  [*] DPI awareness: per-monitor")
-        else:
-            raise Exception("no shcore")
-    except Exception:
-        try:
-            _user32.SetProcessDPIAware.restype = wintypes.BOOL
-            _user32.SetProcessDPIAware.argtypes = []
-            _user32.SetProcessDPIAware()
-            print("  [*] DPI awareness: system")
-        except Exception as _e:
-            print(f"  [!] DPI awareness failed: {_e}")
-
-    # ---- SendInput structures ----
+    # ---- SendInput structures (defined FIRST, then signatures) ----
     PUL = ctypes.POINTER(ctypes.c_ulong)
 
     class MOUSEINPUT(ctypes.Structure):
@@ -104,18 +130,53 @@ try:
         _anonymous_ = ("_u",)
         _fields_ = [("type", ctypes.c_ulong), ("_u", INPUT_UNION)]
 
-    # Now set SendInput argtypes
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.GetClassNameW.restype = ctypes.c_int
+    _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    _user32.SetCursorPos.restype = wintypes.BOOL
+    _user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    _user32.GetCursorPos.restype = wintypes.BOOL
+    _user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    _user32.SendInput.restype = ctypes.c_uint
     _user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+    _user32.mouse_event.restype = None
+    _user32.mouse_event.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_ulong, ctypes.c_void_p]
+    _user32.GetWindowTextLengthW.restype = ctypes.c_int
+    _user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+    # DPI awareness
+    try:
+        if _shcore:
+            _shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+            _shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+            _shcore.SetProcessDpiAwareness(2)
+            print("  [*] DPI awareness: per-monitor")
+        else:
+            raise Exception("no shcore")
+    except Exception:
+        try:
+            _user32.SetProcessDPIAware.restype = wintypes.BOOL
+            _user32.SetProcessDPIAware.argtypes = []
+            _user32.SetProcessDPIAware()
+            print("  [*] DPI awareness: system")
+        except Exception as _e:
+            print(f"  [!] DPI awareness failed: {_e}")
 
     # Constants
-    INPUT_MOUSE          = 0
-    INPUT_KEYBOARD       = 1
-    MOUSEEVENTF_LEFTDOWN = 0x0002
-    MOUSEEVENTF_LEFTUP   = 0x0004
-    MOUSEEVENTF_WHEEL    = 0x0800
-    KEYEVENTF_KEYUP      = 0x0002
+    INPUT_MOUSE           = 0
+    INPUT_KEYBOARD        = 1
+    MOUSEEVENTF_LEFTDOWN  = 0x0002
+    MOUSEEVENTF_LEFTUP    = 0x0004
+    MOUSEEVENTF_RIGHTDOWN = 0x0008
+    MOUSEEVENTF_RIGHTUP   = 0x0010
+    MOUSEEVENTF_WHEEL     = 0x0800
+    KEYEVENTF_KEYUP       = 0x0002
     KEYEVENTF_EXTENDEDKEY = 0x0001
-    WHEEL_DELTA          = 120
+    WHEEL_DELTA           = 120
 
     VK_VOLUME_MUTE = 0xAD
     VK_VOLUME_DOWN = 0xAE
@@ -123,6 +184,11 @@ try:
     VK_MEDIA_PLAY  = 0xB3
     VK_MEDIA_NEXT  = 0xB0
     VK_MEDIA_PREV  = 0xB1
+
+    # Media / navigation keys that need the EXTENDED flag
+    _EXTENDED_VKS = {VK_VOLUME_MUTE, VK_VOLUME_DOWN, VK_VOLUME_UP,
+                     VK_MEDIA_PLAY, VK_MEDIA_NEXT, VK_MEDIA_PREV,
+                     0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E}
 
     _WIN32_OK = True
     print("  [*] Win32 API initialized (64-bit safe)")
@@ -150,76 +216,52 @@ try:
         _send_click()
         print(f"  [DblClick] ({x}, {y})")
 
-except Exception as _e:
-    print(f"  [!] win32 init failed ({_e}); using pyautogui fallback")
-    _WIN32_OK = False
-
-    def reliable_click(x, y):
-        pyautogui.click(x=int(x), y=int(y))
-
-    def reliable_double_click(x, y):
-        pyautogui.doubleClick(x=int(x), y=int(y))
-
-DEBUG_MODE = True  # Set to False in production
-
-def debug_log(msg):
-    if DEBUG_MODE:
-        print(f"  [DEBUG] {msg}")
-
-
-# ---- Reliable Mouse Click (SendInput - modern win32 API) --------------------
-try:
-    import ctypes
-    _user32 = ctypes.windll.user32
-
-    MOUSEEVENTF_LEFTDOWN = 0x0002
-    MOUSEEVENTF_LEFTUP   = 0x0004
-    INPUT_MOUSE          = 0
-
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = [
-            ("dx",          ctypes.c_long),
-            ("dy",          ctypes.c_long),
-            ("mouseData",   ctypes.c_ulong),
-            ("dwFlags",     ctypes.c_ulong),
-            ("time",        ctypes.c_ulong),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-        ]
-
-    class INPUT_UNION(ctypes.Union):
-        _fields_ = [("mi", MOUSEINPUT)]
-
-    class INPUT(ctypes.Structure):
-        _anonymous_ = ("_u",)
-        _fields_ = [("type", ctypes.c_ulong), ("_u", INPUT_UNION)]
-
-    def _send_click():
-        down = INPUT(type=INPUT_MOUSE, _u=INPUT_UNION(mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTDOWN)))
-        up   = INPUT(type=INPUT_MOUSE, _u=INPUT_UNION(mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTUP)))
+    def right_click_at(x, y):
+        x, y = int(x), int(y)
+        _user32.SetCursorPos(x, y)
+        time.sleep(0.04)
+        down = INPUT(type=INPUT_MOUSE, _u=INPUT_UNION(mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_RIGHTDOWN)))
+        up   = INPUT(type=INPUT_MOUSE, _u=INPUT_UNION(mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_RIGHTUP)))
         _user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
         time.sleep(0.08)
         _user32.SendInput(1, ctypes.byref(up),   ctypes.sizeof(INPUT))
 
-    def reliable_click(x, y):
-        x, y = int(x), int(y)
-        _user32.SetCursorPos(x, y)
-        time.sleep(0.04)              # was 0.12
-        _send_click()
-        print(f"  [Click] ({x}, {y})")
+    def _send_key(vk, key_up=False):
+        flags = 0
+        if vk in _EXTENDED_VKS:
+            flags |= KEYEVENTF_EXTENDEDKEY
+        if key_up:
+            flags |= KEYEVENTF_KEYUP
+        inp = INPUT(type=INPUT_KEYBOARD,
+                    _u=INPUT_UNION(ki=KEYBDINPUT(wVk=vk, dwFlags=flags)))
+        _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
-    def reliable_double_click(x, y):
-        x, y = int(x), int(y)
-        _user32.SetCursorPos(x, y)
-        time.sleep(0.04)
-        _send_click()
-        time.sleep(0.05)
-        _send_click()
-        print(f"  [DblClick] ({x}, {y})")
+    def press_vk(vk, times=1, delay=0.08):
+        """Press a virtual-key N times via SendInput (reliable for media keys)."""
+        for _ in range(max(1, int(times))):
+            _send_key(vk, key_up=False)
+            time.sleep(0.03)
+            _send_key(vk, key_up=True)
+            time.sleep(delay)
 
-    print("  [*] Using SendInput mouse API")
+    def hw_scroll(clicks):
+        """Scroll via win32 mouse_event. Positive = up, negative = down."""
+        try:
+            _user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, int(clicks) * WHEEL_DELTA, 0)
+        except Exception:
+            pyautogui.scroll(int(clicks) * 100)
+
+    def _cursor_pos():
+        pt = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        return pt.x, pt.y
 
 except Exception as _e:
     print(f"  [!] win32 init failed ({_e}); using pyautogui fallback")
+    _WIN32_OK = False
+    VK_VOLUME_MUTE, VK_VOLUME_DOWN, VK_VOLUME_UP = 0xAD, 0xAE, 0xAF
+    VK_MEDIA_PLAY, VK_MEDIA_NEXT, VK_MEDIA_PREV = 0xB3, 0xB0, 0xB1
+    MOUSEEVENTF_WHEEL = 0x0800
 
     def reliable_click(x, y):
         pyautogui.click(x=int(x), y=int(y))
@@ -227,20 +269,49 @@ except Exception as _e:
     def reliable_double_click(x, y):
         pyautogui.doubleClick(x=int(x), y=int(y))
 
+    def right_click_at(x, y):
+        pyautogui.click(x=int(x), y=int(y), button="right")
 
-# ---- Window enumeration & management (for taskbar operations) --------------
+    def press_vk(vk, times=1, delay=0.08):
+        key_map = {VK_VOLUME_MUTE: "volumemute", VK_VOLUME_DOWN: "volumedown",
+                   VK_VOLUME_UP: "volumeup", VK_MEDIA_PLAY: "playpause",
+                   VK_MEDIA_NEXT: "nexttrack", VK_MEDIA_PREV: "prevtrack"}
+        key = key_map.get(vk)
+        for _ in range(max(1, int(times))):
+            if key:
+                pyautogui.press(key)
+            time.sleep(delay)
+
+    def hw_scroll(clicks):
+        pyautogui.scroll(int(clicks) * 100)
+
+    def _cursor_pos():
+        try:
+            import pyautogui as _pg
+            return _pg.position()
+        except Exception:
+            return (0, 0)
+
+
+# =============================================================
+#  Window enumeration & management
+# =============================================================
 import ctypes.wintypes as wintypes
 
-EnumWindows = _user32.EnumWindows
-EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-GetWindowText = _user32.GetWindowTextW
-GetWindowTextLength = _user32.GetWindowTextLengthW
-IsWindowVisible = _user32.IsWindowVisible
-IsIconic = _user32.IsIconic  # True if minimized
-GetWindowThreadProcessId = _user32.GetWindowThreadProcessId
-ShowWindow = _user32.ShowWindow
-PostMessage = _user32.PostMessageW
-SetForegroundWindow = _user32.SetForegroundWindow
+try:
+    EnumWindows = _user32.EnumWindows
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    GetWindowText = _user32.GetWindowTextW
+    GetWindowTextLength = _user32.GetWindowTextLengthW
+    IsWindowVisible = _user32.IsWindowVisible
+    IsIconic = _user32.IsIconic
+    GetWindowThreadProcessId = _user32.GetWindowThreadProcessId
+    ShowWindow = _user32.ShowWindow
+    PostMessage = _user32.PostMessageW
+    SetForegroundWindow = _user32.SetForegroundWindow
+    _ENUM_OK = True
+except Exception:
+    _ENUM_OK = False
 
 SW_MINIMIZE = 6
 SW_MAXIMIZE = 3
@@ -248,8 +319,8 @@ SW_RESTORE  = 9
 SW_SHOW     = 5
 WM_CLOSE    = 0x0010
 
+
 def get_process_name(hwnd):
-    """Get the exe name of the process owning this window."""
     try:
         import psutil
         pid = wintypes.DWORD()
@@ -258,9 +329,12 @@ def get_process_name(hwnd):
     except Exception:
         return ""
 
+
 def enum_windows():
-    """Return list of dicts: {hwnd, title, process, minimized} for visible windows."""
     results = []
+    if not _ENUM_OK:
+        return results
+
     def _cb(hwnd, lparam):
         if not IsWindowVisible(hwnd):
             return True
@@ -270,7 +344,6 @@ def enum_windows():
         buf = ctypes.create_unicode_buffer(length + 1)
         GetWindowText(hwnd, buf, length + 1)
         title = buf.value
-        # Skip system shell windows
         if title in ("Program Manager", "Setting", ""):
             return True
         results.append({
@@ -280,29 +353,23 @@ def enum_windows():
             "minimized": bool(IsIconic(hwnd)),
         })
         return True
+
     EnumWindows(EnumWindowsProc(_cb), 0)
     return results
 
+
 def find_windows_by_name(name):
-    """Find all windows matching an app name (chrome, vlc, notepad, etc)."""
     name = name.lower().strip()
     wins = enum_windows()
     matches = []
-    # Map common names to process names
     proc_aliases = {
-        "chrome": ["chrome.exe"],
-        "edge": ["msedge.exe"],
-        "firefox": ["firefox.exe"],
-        "brave": ["brave.exe"],
-        "vlc": ["vlc.exe"],
-        "notepad": ["notepad.exe"],
-        "explorer": ["explorer.exe"],
-        "file explorer": ["explorer.exe"],
+        "chrome": ["chrome.exe"], "edge": ["msedge.exe"],
+        "firefox": ["firefox.exe"], "brave": ["brave.exe"],
+        "vlc": ["vlc.exe"], "notepad": ["notepad.exe"],
+        "explorer": ["explorer.exe"], "file explorer": ["explorer.exe"],
         "calculator": ["calculatorapp.exe", "calc.exe"],
-        "spotify": ["spotify.exe"],
-        "discord": ["discord.exe"],
-        "word": ["winword.exe"],
-        "excel": ["excel.exe"],
+        "spotify": ["spotify.exe"], "discord": ["discord.exe"],
+        "word": ["winword.exe"], "excel": ["excel.exe"],
     }
     target_procs = proc_aliases.get(name, [name + ".exe", name])
     for w in wins:
@@ -312,41 +379,35 @@ def find_windows_by_name(name):
             matches.append(w)
     return matches
 
-# ---- Taskbar / Window Management Actions ----------------------------------
 
 def close_window_by_name(name, occurrence=1):
-    """Close the Nth window matching name. 'all' closes all."""
     matches = find_windows_by_name(name)
     if not matches:
         speak(f"No {name} windows found")
         return
-    
-    if occurrence == "all" or str(occurrence).lower() == "all":
+    if str(occurrence).lower() == "all":
         speak(f"Closing all {len(matches)} {name} windows")
         for w in matches:
             PostMessage(w["hwnd"], WM_CLOSE, 0, 0)
             time.sleep(0.1)
         return
-    
     try:
         n = int(occurrence)
     except Exception:
         n = 1
-    
     if n > len(matches):
         speak(f"Only {len(matches)} {name} windows open")
         return
-    
-    target = matches[n - 1]
     speak(f"Closing {name} window {n}")
-    PostMessage(target["hwnd"], WM_CLOSE, 0, 0)
+    PostMessage(matches[n - 1]["hwnd"], WM_CLOSE, 0, 0)
+
 
 def minimize_window_by_name(name, occurrence=1):
     matches = find_windows_by_name(name)
     if not matches:
         speak(f"No {name} windows found")
         return
-    if occurrence == "all":
+    if str(occurrence).lower() == "all":
         speak(f"Minimizing all {name} windows")
         for w in matches:
             ShowWindow(w["hwnd"], SW_MINIMIZE)
@@ -360,6 +421,7 @@ def minimize_window_by_name(name, occurrence=1):
         return
     speak(f"Minimizing {name} window {n}")
     ShowWindow(matches[n - 1]["hwnd"], SW_MINIMIZE)
+
 
 def restore_window_by_name(name, occurrence=1):
     matches = find_windows_by_name(name)
@@ -379,8 +441,36 @@ def restore_window_by_name(name, occurrence=1):
     ShowWindow(target["hwnd"], SW_RESTORE)
     SetForegroundWindow(target["hwnd"])
 
+
+def maximize_window_by_name(name, occurrence=1):
+    matches = find_windows_by_name(name)
+    if not matches:
+        speak(f"No {name} windows found")
+        return
+    if str(occurrence).lower() == "all":
+        speak(f"Maximizing all {len(matches)} {name} windows")
+        for w in matches:
+            if w["minimized"]:
+                ShowWindow(w["hwnd"], SW_RESTORE)
+            ShowWindow(w["hwnd"], SW_MAXIMIZE)
+            time.sleep(0.1)
+        return
+    try:
+        n = int(occurrence)
+    except Exception:
+        n = 1
+    if n > len(matches):
+        speak(f"Only {len(matches)} {name} windows")
+        return
+    target = matches[n - 1]
+    speak(f"Maximizing {name}")
+    if target["minimized"]:
+        ShowWindow(target["hwnd"], SW_RESTORE)
+    ShowWindow(target["hwnd"], SW_MAXIMIZE)
+    SetForegroundWindow(target["hwnd"])
+
+
 def close_all_minimized():
-    """Close every minimized window."""
     wins = enum_windows()
     minimized = [w for w in wins if w["minimized"]]
     if not minimized:
@@ -391,7 +481,6 @@ def close_all_minimized():
         PostMessage(w["hwnd"], WM_CLOSE, 0, 0)
         time.sleep(0.08)
 
-# ---- Enhanced Minimize / Maximize / Restore (current window) --------------
 
 def minimize_current():
     try:
@@ -400,57 +489,24 @@ def minimize_current():
     except Exception:
         pyautogui.hotkey("win", "down")
 
+
 def maximize_current():
-    """Maximize the currently focused window."""
     speak("Maximizing")
     try:
-        hwnd = _user32.GetForegroundWindow()
-        ShowWindow(hwnd, SW_MAXIMIZE)
+        _user32.ShowWindow(_user32.GetForegroundWindow(), SW_MAXIMIZE)
     except Exception:
         pyautogui.hotkey("win", "up")
 
+
 def restore_current():
-    """Restore the currently focused window (un-maximize)."""
     speak("Restoring window")
     try:
-        hwnd = _user32.GetForegroundWindow()
-        ShowWindow(hwnd, SW_RESTORE)
+        _user32.ShowWindow(_user32.GetForegroundWindow(), SW_RESTORE)
     except Exception:
         pyautogui.hotkey("win", "down")
 
-def maximize_window_by_name(name, occurrence=1):
-    """Maximize a specific window by app name."""
-    matches = find_windows_by_name(name)
-    if not matches:
-        speak(f"No {name} windows found")
-        return
-
-    if occurrence == "all" or str(occurrence).lower() == "all":
-        speak(f"Maximizing all {len(matches)} {name} windows")
-        for w in matches:
-            if w["minimized"]:
-                ShowWindow(w["hwnd"], SW_RESTORE)
-            ShowWindow(w["hwnd"], SW_MAXIMIZE)
-            time.sleep(0.1)
-        return
-
-    try:
-        n = int(occurrence)
-    except Exception:
-        n = 1
-    if n > len(matches):
-        speak(f"Only {len(matches)} {name} windows")
-        return
-
-    target = matches[n - 1]
-    speak(f"Maximizing {name}")
-    if target["minimized"]:
-        ShowWindow(target["hwnd"], SW_RESTORE)
-    ShowWindow(target["hwnd"], SW_MAXIMIZE)
-    SetForegroundWindow(target["hwnd"])
 
 def maximize_all_windows():
-    """Maximize all open visible windows."""
     wins = enum_windows()
     if not wins:
         speak("No windows open")
@@ -465,8 +521,8 @@ def maximize_all_windows():
         except Exception:
             pass
 
+
 def restore_all_minimized():
-    """Restore all minimized windows."""
     wins = enum_windows()
     minimized = [w for w in wins if w["minimized"]]
     if not minimized:
@@ -477,16 +533,18 @@ def restore_all_minimized():
         ShowWindow(w["hwnd"], SW_RESTORE)
         time.sleep(0.05)
 
+
 def minimize_all_windows():
     speak("Minimizing all windows")
     pyautogui.hotkey("win", "d")
+
 
 def restore_all_windows():
     speak("Restoring windows")
     pyautogui.hotkey("win", "shift", "m")
 
+
 def list_open_windows():
-    """Speak the list of open windows (useful for debugging)."""
     wins = enum_windows()
     if not wins:
         speak("No windows open")
@@ -498,9 +556,8 @@ def list_open_windows():
     print()
     speak(f"{len(wins)} windows open. Check console.")
 
+
 def click_taskbar_icon(name, occurrence=1):
-    """Click a taskbar icon by hovering over the taskbar and matching."""
-    # Simpler approach: just activate the window via API
     matches = find_windows_by_name(name)
     if not matches:
         speak(f"No {name} in taskbar")
@@ -518,9 +575,8 @@ def click_taskbar_icon(name, occurrence=1):
     SetForegroundWindow(target["hwnd"])
 
 
-# ---- Detect windows that need double-click (File Explorer, Desktop) --------
+# ---- Detect windows that need double-click (File Explorer, Desktop) ----
 def get_foreground_class():
-    """Returns the window class of the active window."""
     try:
         hwnd = _user32.GetForegroundWindow()
         buf = ctypes.create_unicode_buffer(256)
@@ -529,16 +585,13 @@ def get_foreground_class():
     except Exception:
         return ""
 
+
 def needs_double_click():
-    """File Explorer, Desktop, and some list views need double-click to open."""
     cls = get_foreground_class().lower()
-    # CabinetWClass = File Explorer window
-    # Progman / WorkerW = Desktop
-    # ExploreWClass = older explorer views
     return any(k in cls for k in ("cabinetwclass", "progman", "workerw", "explorewclass"))
 
+
 def smart_click(x, y):
-    """Automatically double-click in File Explorer / Desktop, single-click elsewhere."""
     if needs_double_click():
         print("  [Smart] File Explorer / Desktop detected -> double click")
         reliable_double_click(x, y)
@@ -546,52 +599,9 @@ def smart_click(x, y):
         reliable_click(x, y)
 
 
-# ---- Direct Virtual-Key presses via SendInput (works everywhere) ----------
-VK_VOLUME_MUTE   = 0xAD
-VK_VOLUME_DOWN   = 0xAE
-VK_VOLUME_UP     = 0xAF
-VK_MEDIA_PLAY    = 0xB3
-VK_MEDIA_NEXT    = 0xB0
-VK_MEDIA_PREV    = 0xB1
-
-INPUT_KEYBOARD      = 1
-KEYEVENTF_KEYUP     = 0x0002
-KEYEVENTF_EXTENDEDKEY = 0x0001
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk",         ctypes.c_ushort),
-        ("wScan",       ctypes.c_ushort),
-        ("dwFlags",     ctypes.c_ulong),
-        ("time",        ctypes.c_ulong),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
-
-class INPUT_UNION_KB(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT)]
-
-class INPUT_KB(ctypes.Structure):
-    _anonymous_ = ("_u",)
-    _fields_ = [("type", ctypes.c_ulong), ("_u", INPUT_UNION_KB)]
-
-def _send_key(vk, key_up=False):
-    flags = KEYEVENTF_EXTENDEDKEY
-    if key_up:
-        flags |= KEYEVENTF_KEYUP
-    inp = INPUT(type=INPUT_KEYBOARD,
-                _u=INPUT_UNION(ki=KEYBDINPUT(wVk=vk, dwFlags=flags)))
-    _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
-
-def press_vk(vk, times=1, delay=0.08):
-    """Press a virtual-key N times via SendInput (reliable for media keys)."""
-    for _ in range(times):
-        _send_key(vk, key_up=False)
-        time.sleep(0.03)
-        _send_key(vk, key_up=True)
-        time.sleep(delay)
-
-
-# ---- Mouse movement (relative) --------------------------------------------
+# =============================================================
+#  Mouse movement (relative)
+# =============================================================
 _DIR_H = {"right": 1, "left": -1, "east": 1, "west": -1}
 _DIR_V = {"down": 1, "up": -1, "south": 1, "north": -1}
 _MAG = [("a little", 60), ("little", 80), ("bit", 80), ("slightly", 80),
@@ -601,12 +611,10 @@ _MAG = [("a little", 60), ("little", 80), ("bit", 80), ("slightly", 80),
 
 
 def parse_direction(text):
-    """'go a little to the right' -> ('right', 1, 0)"""
     t = " " + re.sub(r"[^a-z0-9 ]", " ", text.lower()) + " "
     t = t.replace(" upward ", " up ").replace(" downward ", " down ")
     t = t.replace(" upper ", " up ").replace(" lower ", " down ")
     t = t.replace(" top ", " up ").replace(" bottom ", " down ")
-    t = t.replace(" towards the top ", " up ")
     h = v = 0
     for w, s in _DIR_H.items():
         if re.search(rf"\b{w}\b", t):
@@ -617,8 +625,8 @@ def parse_direction(text):
             v = s
             break
     if h and v:
-        return ("up right" if v < 0 else "down right") if h > 0 else \
-               ("up left" if v < 0 else "down left"), h, v
+        return (("up right" if v < 0 else "down right") if h > 0
+                else ("up left" if v < 0 else "down left")), h, v
     if h:
         return ("right" if h > 0 else "left"), h, 0
     if v:
@@ -628,7 +636,7 @@ def parse_direction(text):
 
 def parse_move_amount(text, default=200):
     t = text.lower()
-    m = re.search(r"\b(\d{2,4})\b", t)                 # explicit pixels
+    m = re.search(r"\b(\d{2,4})\b", t)
     if m:
         return max(5, min(3000, int(m.group(1))))
     for word, val in _MAG:
@@ -637,23 +645,12 @@ def parse_move_amount(text, default=200):
     return default
 
 
-def _cursor_pos():
-    import ctypes
-    from ctypes import wintypes
-    pt = wintypes.POINT()
-    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-    return pt.x, pt.y
-
-
 def _set_cursor(x, y):
-    import ctypes
     u = ctypes.windll.user32
-    # keep it off (0,0): pyautogui's FAILSAFE corner
     u.SetCursorPos(int(max(2, min(x, 100000))), int(max(2, min(y, 100000))))
 
 
 def move_mouse(direction, amount=None):
-    import pyautogui
     name, h, v = parse_direction(direction)
     if not h and not v:
         speak("Which direction?")
@@ -663,18 +660,16 @@ def move_mouse(direction, amount=None):
 
     screen_w, screen_h = pyautogui.size()
     x, y = _cursor_pos()
-    dx = h * amount
-    dy = v * amount
-    if h and v:                    # keep diagonals from being ~1.4x faster
+    dx, dy = h * amount, v * amount
+    if h and v:
         dx, dy = int(dx * 0.707), int(dy * 0.707)
 
     nx = max(1, min(screen_w - 2, x + dx))
     ny = max(1, min(screen_h - 2, y + dy))
 
     if nx == x and ny == y:
-        # pinned against an edge: scrolling is what the user almost certainly meant
         if v and not h:
-            clicks = -12 if v > 0 else 12          # wheel: negative = down
+            clicks = -12 if v > 0 else 12
             try:
                 hw_scroll(clicks)
                 speak(f"At the screen edge - scrolling {'down' if v > 0 else 'up'}")
@@ -684,231 +679,43 @@ def move_mouse(direction, amount=None):
             speak("Cursor is already at the screen edge")
         return
 
-    _set_cursor(nx, ny)
+    if _WIN32_OK:
+        _set_cursor(nx, ny)
+    else:
+        pyautogui.moveTo(nx, ny)
     print(f"  [Move] {name} {amount}px: ({x},{y}) -> ({nx},{ny})")
-    speak(f"Moving {name}")
+    speak(f"Moving {name}", wait=False)
 
 
 def click_here():
-    """Click at the current mouse cursor position."""
-    try:
-        from ctypes import wintypes
-        pt = wintypes.POINT()
-        _user32.GetCursorPos(ctypes.byref(pt))
-        x, y = pt.x, pt.y
-        speak("Clicking here")
-        smart_click(x, y)
-    except Exception as e:
-        print(f"  [!] Click here error: {e}")
-        speak("Click failed")
+    pt = _cursor_pos()
+    speak("Clicking here")
+    smart_click(pt[0], pt[1])
 
 
 def double_click_here():
-    """Double click at the current mouse cursor position."""
-    try:
-        from ctypes import wintypes
-        pt = wintypes.POINT()
-        _user32.GetCursorPos(ctypes.byref(pt))
-        x, y = pt.x, pt.y
-        speak("Double clicking here")
-        reliable_double_click(x, y)
-    except Exception as e:
-        print(f"  [!] Double click error: {e}")
+    pt = _cursor_pos()
+    speak("Double clicking here")
+    reliable_double_click(pt[0], pt[1])
 
 
 def right_click_here():
-    """Right click at the current mouse cursor position."""
-    try:
-        from ctypes import wintypes
-        pt = wintypes.POINT()
-        _user32.GetCursorPos(ctypes.byref(pt))
-        x, y = pt.x, pt.y
-        speak("Right clicking")
-        _user32.SetCursorPos(x, y)
-        time.sleep(0.04)
-        # Right click via SendInput
-        MOUSEEVENTF_RIGHTDOWN = 0x0008
-        MOUSEEVENTF_RIGHTUP = 0x0010
-        down = INPUT(type=INPUT_MOUSE, _u=INPUT_UNION(mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_RIGHTDOWN)))
-        up = INPUT(type=INPUT_MOUSE, _u=INPUT_UNION(mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_RIGHTUP)))
-        _user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
-        time.sleep(0.08)
-        _user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(INPUT))
-    except Exception as e:
-        print(f"  [!] Right click error: {e}")
+    pt = _cursor_pos()
+    speak("Right clicking")
+    right_click_at(pt[0], pt[1])
 
 
-# ---- Reliable scroll via mouse_event (big & smooth) -----------------------
-MOUSEEVENTF_WHEEL = 0x0800
-WHEEL_DELTA = 120
-
-def hw_scroll(clicks):
-    """Scroll via win32 mouse_event. Positive = up, negative = down."""
-    try:
-        _user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, int(clicks) * WHEEL_DELTA, 0)
-    except Exception:
-        pyautogui.scroll(int(clicks) * 100)
-
-
-# ---- Configuration ----------------------------------------------------------
-
+# =============================================================
+#  Configuration
+# =============================================================
 OLLAMA_URL = "http://localhost:11434"
 OLLAMA_MODEL = "qwen2.5:1.5b"
 OLLAMA_VISION_MODEL = "moondream:1.8b"
 
-WAKE_WORDS = ["rolex", "hey rolex", "rolex mini", "rollex", "rolax", 
+WAKE_WORDS = ["rolex", "hey rolex", "rolex mini", "rollex", "rolax",
               "rolix", "rollix", "rolexx"]
 
-# EXIT: Must include "rolex" word to prevent accidental exits
-EXIT_PHRASES = [
-    "rolex exit", "exit rolex", "rolex quit", "quit rolex",
-    "rolex close yourself", "close yourself rolex",
-    "rolex shutdown", "shutdown rolex", "rolex shut down",
-    "rolex close", "close rolex", "rolex goodbye", "goodbye rolex",
-    "rolex terminate", "terminate rolex",
-    "rolex turn off", "turn off rolex",
-    "rolex power off", "power off rolex",
-    "rolex kill yourself", "kill rolex",
-    "rolex bye", "bye rolex",
-    "rolex stop forever", "rolex die",
-]
-
-# SLEEP: Must include "rolex" word 
-SLEEP_PHRASES = [
-    "rolex sleep", "sleep rolex", "rolex go to sleep", "go to sleep rolex",
-    "rolex sleep now", "sleep now rolex",
-    "rolex stop listening", "stop listening rolex",
-    "rolex pause", "pause rolex", "rolex pause listening",
-    "rolex sleep mode", "sleep mode rolex",
-    "rolex rest", "rest rolex",
-    "rolex standby", "standby rolex", "rolex stand by",
-    "rolex quiet mode", "quiet mode rolex",
-    "rolex be quiet", "be quiet rolex",
-    "rolex goodnight", "goodnight rolex", "rolex good night", "good night rolex",
-    "rolex night", "night rolex",
-    "rolex take a break", "take a break rolex",
-    "rolex silent", "silent rolex",
-]
-
-
-def has_wake(text):
-    """Check if text contains the wake word."""
-    if not text:
-        return False
-    t = text.lower().strip()
-    
-    for w in WAKE_WORDS:
-        # Use word boundary matching
-        if re.search(r"\b" + re.escape(w) + r"\b", t):
-            return True
-        # Also check if the ENTIRE text IS the wake word
-        if t == w:
-            return True
-    return False
-
-
-def strip_wake(text):
-    """Remove wake word from text, returning just the command."""
-    if not text:
-        return ""
-    t = text.lower().strip()
-    
-    # Sort wake words longest first (so "hey rolex" matches before "rolex")
-    sorted_wake = sorted(WAKE_WORDS, key=len, reverse=True)
-    
-    # Try removing from start first
-    for w in sorted_wake:
-        if t.startswith(w + " ") or t == w:
-            remaining = t[len(w):].strip()
-            # Clean up punctuation and fillers
-            remaining = remaining.lstrip(",.!?;:")
-            remaining = re.sub(r"^(please|can you|could you|would you|now)\s+", "", remaining)
-            return remaining.strip()
-    
-    # Try removing from end
-    for w in sorted_wake:
-        if t.endswith(" " + w):
-            remaining = t[:-len(w)].strip()
-            remaining = remaining.rstrip(",.!?;:")
-            return remaining.strip()
-    
-    # Try removing from middle (less common but possible)
-    for w in sorted_wake:
-        pattern = r"\b" + re.escape(w) + r"\b"
-        if re.search(pattern, t):
-            new = re.sub(pattern, "", t, count=1).strip()
-            new = re.sub(r"\s+", " ", new)  # collapse multiple spaces
-            new = new.strip(",.!?;: ")
-            return new
-    
-    return t  # No wake word found, return as-is
-
-
-_EXIT_WORDS = ("exit", "quit", "shutdown", "shut down", "terminate", "goodbye",
-               "bye", "kill yourself", "close yourself", "turn off", "power off",
-               "stop forever", "die", "shut yourself down")
-_SCREEN_WORDS = ("click", "press", "tap", "open", "close", "tab", "window", "page",
-                 "button", "link", "menu", "dialog", "save", "file", "search")
-_SLEEP_WORDS = ("go to sleep", "sleep now", "sleep mode", "sleep", "goodnight",
-                "good night", "standby", "stand by", "stop listening",
-                "pause listening", "be quiet", "quiet mode", "silent mode",
-                "take a break", "rest now")
-_MEDIA_WORDS = ("video", "music", "song", "movie", "playback", "media", "volume",
-                "playlist", "the track")
-
-
-def _clean(text):
-    t = text.lower().replace("'", "").replace("\u2019", "")   # "that's" -> "thats"
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", t)).strip()
-
-
-_FILLERS = {"please", "now", "right", "immediately", "rolex", "can", "could",
-            "you", "would", "just", "go", "and", "the", "program", "app",
-            "application", "assistant", "for", "good", "ok", "okay"}
-
-
-def _core_words(rest):
-    """Drop politeness / filler words so 'can you exit please' == 'exit'."""
-    return " ".join(w for w in rest.split() if w not in _FILLERS)
-
-
-def is_exit(text):
-    """Exit ONLY on an explicit exit word that is not part of a screen command."""
-    if not text or not has_wake(text):
-        return False
-    rest = _clean(strip_wake(text))
-    if not rest:
-        return False
-    core = _core_words(rest)
-    if core in ("exit", "quit", "shutdown", "shut down", "terminate", "goodbye",
-                "bye", "kill yourself", "close yourself", "turn off", "power off",
-                "stop forever", "die", "shut yourself down"):
-        return True
-    # "rolex exit the program" / "close yourself down"  (only innocuous tails)
-    tails = {"the", "program", "app", "application", "yourself", "assistant",
-             "everything", "down", "off", "out", "all", "completely"}
-    for w in _EXIT_WORDS:
-        if re.match(rf"^{re.escape(w)}\b", core):
-            extra = core[len(w):].split()
-            if all(e in tails for e in extra):
-                return True
-    # "close chrome" / "click the exit button" must NOT count as exit
-    if any(re.search(rf"\b{re.escape(w)}\b", rest) for w in _SCREEN_WORDS):
-        return False
-    return False
-
-
-def is_sleep_command(text):
-    if not text or not has_wake(text):
-        return False
-    rest = _clean(strip_wake(text))
-    if not rest:
-        return False
-    if any(re.search(rf"\b{re.escape(w)}\b", rest) for w in _MEDIA_WORDS):
-        return False                       # "pause the video" is media, not sleep
-    if rest in ("pause", "rest", "quiet", "silent"):   # bare word = sleep
-        return True
-    return any(re.search(rf"\b{re.escape(w)}\b", rest) for w in _SLEEP_WORDS)
+AUTO_SLEEP_TIMEOUT = 120  # seconds of inactivity before auto-sleep
 
 APP_MAP = {
     "chrome":          ("start", "chrome"),
@@ -958,20 +765,17 @@ ORDINALS = {
     "tenth": 10, "10th": 10,
 }
 
-# ---- Redis Cache for Vision & Screen (fast image recognition) --------------
+# =============================================================
+#  Redis cache (optional) + screenshot hash (ONE screenshot reused)
+# =============================================================
 try:
     import redis
     import hashlib
 
     _redis_client = redis.Redis(
-        host="localhost", 
-        port=6379, 
-        db=0,
-        decode_responses=False,
-        socket_timeout=2,
-        socket_connect_timeout=2,
+        host="localhost", port=6379, db=0,
+        decode_responses=False, socket_timeout=2, socket_connect_timeout=2,
     )
-    # Test connection
     _redis_client.ping()
     _REDIS_AVAILABLE = True
     print("  [OK] Redis connected - vision caching enabled")
@@ -981,8 +785,14 @@ except Exception as _e:
     print(f"  [!] Redis not available ({_e}) - using memory cache")
 
 
+def _thumb_hash_from_image(img):
+    thumb = img.resize((64, 36), Image.LANCZOS)
+    buf = io.BytesIO()
+    thumb.save(buf, format="JPEG", quality=20)
+    return hashlib.md5(buf.getvalue()).hexdigest()[:12]
+
+
 def redis_cache_key(prefix, data):
-    """Generate a cache key from prefix + data hash."""
     if isinstance(data, str):
         data = data.encode("utf-8")
     h = hashlib.md5(data).hexdigest()[:16]
@@ -990,7 +800,6 @@ def redis_cache_key(prefix, data):
 
 
 def redis_get(key):
-    """Get value from Redis, return None if not found."""
     if not _REDIS_AVAILABLE:
         return None
     try:
@@ -1003,7 +812,6 @@ def redis_get(key):
 
 
 def redis_set(key, value, ttl=60):
-    """Store value in Redis with TTL (seconds)."""
     if not _REDIS_AVAILABLE:
         return
     try:
@@ -1012,20 +820,14 @@ def redis_set(key, value, ttl=60):
         print(f"  [!] Redis set error: {e}")
 
 
-def redis_cache_screenshot_hash():
-    """Get a hash of the current screen (for cache invalidation)."""
+def take_screenshot():
+    """Single screenshot helper - reused by OCR and vision."""
     try:
-        screenshot = pyautogui.screenshot()
-        # Downsample heavily for fast hashing
-        thumb = screenshot.resize((64, 36), Image.LANCZOS)
-        buf = io.BytesIO()
-        thumb.save(buf, format="JPEG", quality=20)
-        return hashlib.md5(buf.getvalue()).hexdigest()[:12]
-    except Exception:
-        return str(int(time.time()))
+        return pyautogui.screenshot()
+    except Exception as e:
+        print(f"  [!] Screenshot failed: {e}")
+        return None
 
-
-# ---- Cache ------------------------------------------------------------------
 
 _cmd_cache = {}
 _ollama_ok_cache = {"val": None, "time": 0}
@@ -1033,14 +835,12 @@ _vision_ok_cache = {"val": None, "time": 0}
 
 
 def cached_ollama(prompt):
-    # Redis first
     if _REDIS_AVAILABLE:
         rkey = redis_cache_key("ollama", prompt)
         cached = redis_get(rkey)
         if cached is not None:
             return cached.get("result")
 
-    # Memory cache
     if prompt in _cmd_cache:
         return _cmd_cache[prompt]
 
@@ -1049,8 +849,6 @@ def cached_ollama(prompt):
         if len(_cmd_cache) > 200:
             _cmd_cache.clear()
         _cmd_cache[prompt] = result
-
-        # Store in Redis
         if _REDIS_AVAILABLE:
             rkey = redis_cache_key("ollama", prompt)
             redis_set(rkey, {"result": result}, ttl=300)
@@ -1058,7 +856,9 @@ def cached_ollama(prompt):
     return result
 
 
-# ---- Mic settings (dynamic channel detection) -----------------------------
+# =============================================================
+#  Mic settings (dynamic channel detection)
+# =============================================================
 def get_mic_settings():
     try:
         dev_idx = sd.default.device[0]
@@ -1073,23 +873,23 @@ def get_mic_settings():
         print(f"  [!] Mic error: {e}")
         return 1, 44100, 0
 
+
 MIC_CHANNELS, MIC_SAMPLE_RATE, MIC_DEVICE_IDX = get_mic_settings()
 
-# ---- Persistent noise floor (calibrated once at startup) ------------------
-NOISE_FLOOR = 300  # overridden by calibration
-SILENCE_MULT = 1.6  # silence threshold = NOISE_FLOOR * this
+NOISE_FLOOR = 300
+SILENCE_MULT = 1.6
 MAX_RECORD_SECONDS = 10
-SILENCE_SHORT = 0.4   # for quick commands (<= 1.5s of speech)
-SILENCE_LONG  = 1.0   # for longer commands
+SILENCE_SHORT = 0.35   # quick commands end fast       (was 0.4)
+SILENCE_LONG  = 0.8    # longer commands                (was 1.0)
+
 
 def calibrate_noise_floor(seconds=0.6):
-    """Measure ambient noise ONCE at startup. Avoids 300ms per-command cost."""
     global NOISE_FLOOR
     try:
         print(f"  [*] Calibrating noise floor ({seconds}s)...")
         samples = int(MIC_SAMPLE_RATE * seconds)
         data = sd.rec(samples, samplerate=MIC_SAMPLE_RATE,
-                       channels=MIC_CHANNELS, dtype="int16")
+                      channels=MIC_CHANNELS, dtype="int16")
         sd.wait()
         mono = data[:, 0] if data.ndim > 1 else data.flatten()
         rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
@@ -1098,26 +898,30 @@ def calibrate_noise_floor(seconds=0.6):
     except Exception as e:
         print(f"  [!] Calibration failed, using default: {e}")
 
+
 def drain_mic():
-    """Flush any buffered audio. Reduced from 250ms to 50ms."""
     try:
-        sd.rec(int(MIC_SAMPLE_RATE * 0.05),
-                samplerate=MIC_SAMPLE_RATE,
-                channels=MIC_CHANNELS, dtype="int16")
+        sd.rec(int(MIC_SAMPLE_RATE * 0.08),
+               samplerate=MIC_SAMPLE_RATE,
+               channels=MIC_CHANNELS, dtype="int16")
         sd.wait()
     except Exception:
         pass
 
 
-# ---- Thread-safe TTS (SAPI5 COM requires per-thread init) -----------------
+# =============================================================
+#  Thread-safe TTS (SAPI5 COM requires per-thread init)
+#  + real "is speaking" event so listen() never hears its own voice
+# =============================================================
 import queue as _queue
 
 _speech_queue = _queue.Queue()
 _speech_thread = None
 _speech_lock = threading.Lock()
+_tts_speaking = threading.Event()   # set while the engine is actually speaking
+
 
 def _speech_worker():
-    """Runs in its own thread. Initializes pyttsx3 LOCALLY for COM safety."""
     try:
         import pythoncom
         pythoncom.CoInitialize()
@@ -1140,13 +944,16 @@ def _speech_worker():
     while True:
         try:
             text = _speech_queue.get(timeout=60)
-            if text is None:  # sentinel to shut down
+            if text is None:
                 break
             try:
+                _tts_speaking.set()
                 local_engine.say(text)
                 local_engine.runAndWait()
             except Exception as e:
                 print(f"  [!] TTS error: {e}")
+            finally:
+                _tts_speaking.clear()
         except _queue.Empty:
             continue
 
@@ -1154,6 +961,9 @@ def _speech_worker():
         local_engine.stop()
     except Exception:
         pass
+    finally:
+        _tts_speaking.clear()
+
 
 def _ensure_speech_thread():
     global _speech_thread
@@ -1162,37 +972,44 @@ def _ensure_speech_thread():
             _speech_thread = threading.Thread(target=_speech_worker, daemon=True)
             _speech_thread.start()
 
+
 def speak(text, wait=False):
-    """Non-blocking by default. TTS runs in dedicated COM-safe thread."""
     print(f"  [Rolex] {text}")
     _ensure_speech_thread()
     _speech_queue.put(text)
     if wait:
-        # Wait briefly for the queue to drain
-        while not _speech_queue.empty():
-            time.sleep(0.05)
+        wait_for_tts()
+
 
 def wait_for_tts(timeout=10.0):
-    """Block until the TTS queue is drained."""
+    """Block until the engine has FINISHED speaking (not just drained queue)."""
     end = time.time() + timeout
-    while time.time() < end:
-        if _speech_queue.empty():
-            return True
+    # Wait for speech to start (it may still be queued)
+    start_deadline = time.time() + 0.5
+    while time.time() < start_deadline:
+        if _tts_speaking.is_set() or _speech_queue.empty():
+            break
+        time.sleep(0.02)
+    # Then wait for it to finish
+    while _tts_speaking.is_set():
+        if time.time() > end:
+            return False
         time.sleep(0.05)
-    return False
+    return True
+
 
 print("  [*] TTS engine ready (thread-safe)")
 
 
-# ---- Audio Recording & STT --------------------------------------------------
-
+# =============================================================
+#  Audio Recording & STT
+# =============================================================
 def record_audio(max_seconds=MAX_RECORD_SECONDS):
-    """Adaptive VAD: short silence for quick commands, longer for complex ones."""
     frames = []
     silence_count = 0
     speech_count = 0
     has_speech = False
-    block_dur = 0.08  # 80ms blocks (faster response)
+    block_dur = 0.08
     block_size = int(MIC_SAMPLE_RATE * block_dur)
     max_blocks = int(max_seconds / block_dur)
 
@@ -1217,12 +1034,11 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
             else:
                 silence_count += 1
 
-            # Adaptive silence window: short commands end fast
             speech_duration = speech_count * block_dur
             if speech_duration <= 1.5:
-                silence_needed = int(SILENCE_SHORT / block_dur)  # 0.4s
+                silence_needed = int(SILENCE_SHORT / block_dur)
             else:
-                silence_needed = int(SILENCE_LONG / block_dur)   # 1.0s
+                silence_needed = int(SILENCE_LONG / block_dur)
 
             if has_speech and silence_count >= silence_needed:
                 break
@@ -1250,8 +1066,6 @@ def audio_to_wav_bytes(audio):
     return buf.getvalue()
 
 
-# ---- STT (uses Google - requires internet) ---------------------------------
-
 try:
     import speech_recognition as _sr_module
 except ImportError:
@@ -1260,27 +1074,28 @@ except ImportError:
 
 _stt_fail_streak = {"n": 0}
 
+
 def transcribe(audio):
     if _sr_module is None:
         print("  [!] speech_recognition missing: pip install SpeechRecognition")
         return None
-    if audio is None or len(audio) < 1600:       # < 0.1 s
+    if audio is None or len(audio) < 1600:
         return None
     wav = audio_to_wav_bytes(audio)
     rec = _sr_module.Recognizer()
+    rec.pause_threshold = 0.6
+    rec.non_speaking_duration = 0.4
     data = _sr_module.AudioData(wav, 16000, 2)
     try:
         text = rec.recognize_google(data)
         _stt_fail_streak["n"] = 0
         return text.lower().strip()
     except _sr_module.UnknownValueError:
-        print("  [STT] Google: nothing intelligible (silence / too quiet / noise)")
+        print("  [STT] nothing intelligible")
         return None
     except _sr_module.RequestError as e:
         _stt_fail_streak["n"] += 1
         print(f"  [STT] Google unreachable ({e}) - streak={_stt_fail_streak['n']}")
-        if _stt_fail_streak["n"] == 3:
-            print("  [!] STT is failing repeatedly -> check internet / firewall.")
         return None
     except Exception as e:
         print(f"  [!] Transcription error: {type(e).__name__}: {e}")
@@ -1290,21 +1105,26 @@ def transcribe(audio):
 def listen(prompt=None, timeout=MAX_RECORD_SECONDS):
     if prompt:
         speak(prompt)
-    wait_for_tts()
+    wait_for_tts()          # don't record over our own voice
     drain_mic()
     print("  [*] Listening...")
+    t0 = time.time()
     audio = record_audio(max_seconds=timeout)
     if audio is None:
         print("  [..] No speech detected")
         return None
-    print("  [*] Recognizing...")
+    print(f"  [*] Recognizing... ({time.time()-t0:.1f}s audio)")
     text = transcribe(audio)
     if text:
-        print(f"  [Heard] \"{text}\"")
+        print(f"  [Heard] \"{text}\"  ({time.time()-t0:.1f}s total)")
     return text
 
+
 recognize_speech = listen
-# ---- Continuous action control --------------------------------------------
+
+# =============================================================
+#  Continuous action control
+# =============================================================
 _continuous_action = {
     "running": False,
     "thread": None,
@@ -1312,11 +1132,11 @@ _continuous_action = {
 }
 
 STOP_PHRASES = [
-    "stop", "stop it", "stop now", "stop stop", "that's enough", 
+    "stop", "stop it", "stop now", "stop stop", "that's enough",
     "enough", "halt", "cease", "quit it", "okay stop", "ok stop",
     "stop scrolling", "stop moving", "pause", "freeze", "hold",
     "done", "that's good", "thats enough", "good", "perfect",
-    "rolex stop", "stop rolex"
+    "rolex stop", "stop rolex",
 ]
 
 _STOP_WHOLE = {"stop", "stop it", "stop now", "stop stop", "ok stop", "okay stop",
@@ -1327,7 +1147,6 @@ _STOP_WHOLE = {"stop", "stop it", "stop now", "stop stop", "ok stop", "okay stop
 
 
 def is_stop_command(text):
-    """Only a stop that is basically the whole utterance counts."""
     if not text:
         return False
     t = _clean(text)
@@ -1344,13 +1163,14 @@ def is_stop_command(text):
         return True
     return False
 
+
 def stop_continuous_action():
-    """Signal any running continuous action to stop."""
     if _continuous_action["running"]:
         _continuous_action["stop_flag"].set()
         print("  [Stop] Stopping continuous action")
         return True
     return False
+
 
 def handle_stop():
     if stop_continuous_action():
@@ -1358,11 +1178,8 @@ def handle_stop():
     else:
         speak("Nothing to stop")
 
+
 def listen_for_stop_async():
-    """
-    Spawn a listener that specifically watches for stop commands.
-    Runs while a continuous action is active.
-    """
     def _listen_loop():
         while _continuous_action["running"]:
             try:
@@ -1383,8 +1200,8 @@ def listen_for_stop_async():
 
     threading.Thread(target=_listen_loop, daemon=True).start()
 
+
 def continuous_scroll(direction="down", speed="normal"):
-    """Scroll continuously until user says stop."""
     if _continuous_action["running"]:
         speak("Already running. Say stop first.")
         return
@@ -1397,7 +1214,7 @@ def continuous_scroll(direction="down", speed="normal"):
     cfg = speed_map.get(speed, speed_map["normal"])
 
     speak(f"Scrolling {direction}. Say stop when done.")
-    time.sleep(0.3)  # let TTS finish before mic opens
+    time.sleep(0.3)
 
     _continuous_action["running"] = True
     _continuous_action["stop_flag"].clear()
@@ -1418,31 +1235,30 @@ def continuous_scroll(direction="down", speed="normal"):
 
 
 def continuous_move(direction, speed="normal"):
-    """Move mouse continuously until stopped."""
     if _continuous_action["running"]:
         speak("Already running. Say stop first.")
         return
-    
+
     speed_map = {
         "slow":   {"step": 5,  "delay": 0.03},
         "normal": {"step": 10, "delay": 0.02},
         "fast":   {"step": 20, "delay": 0.015},
     }
     cfg = speed_map.get(speed, speed_map["normal"])
-    
+
     step = cfg["step"]
     d = direction.lower().strip()
-    d = d.replace("upper ", "up ").replace("lower ", "down ")
-    
+    d = d.replace("upper", "up").replace("lower", "down")
+
     dx, dy = 0, 0
-    if "up" in d and "right" in d:      dx, dy = step, -step
-    elif "up" in d and "left" in d:     dx, dy = -step, -step
-    elif "down" in d and "right" in d:  dx, dy = step, step
-    elif "down" in d and "left" in d:   dx, dy = -step, step
-    elif "right" in d:                  dx = step
-    elif "left" in d:                   dx = -step
-    elif "up" in d:                     dy = -step
-    elif "down" in d:                   dy = step
+    if "up" in d and "right" in d:   dx, dy = step, -step
+    elif "up" in d and "left" in d:  dx, dy = -step, -step
+    elif "down" in d and "right" in d: dx, dy = step, step
+    elif "down" in d and "left" in d:  dx, dy = -step, step
+    elif "right" in d:               dx = step
+    elif "left" in d:                dx = -step
+    elif "up" in d:                  dy = -step
+    elif "down" in d:                dy = step
     else:
         speak(f"Unknown direction {direction}")
         return
@@ -1455,21 +1271,18 @@ def continuous_move(direction, speed="normal"):
 
     def _move_loop():
         try:
-            from ctypes import wintypes
             screen_w, screen_h = pyautogui.size()
-
             while not _continuous_action["stop_flag"].is_set():
-                pt = wintypes.POINT()
-                _user32.GetCursorPos(ctypes.byref(pt))
-                new_x = max(0, min(screen_w - 1, pt.x + dx))
-                new_y = max(0, min(screen_h - 1, pt.y + dy))
-
-                if new_x == pt.x and new_y == pt.y:
+                x, y = _cursor_pos()
+                nx = max(0, min(screen_w - 1, x + dx))
+                ny = max(0, min(screen_h - 1, y + dy))
+                if nx == x and ny == y:
                     print("  [Move] Hit screen edge, stopping")
                     break
-
-                _user32.SetCursorPos(new_x, new_y)
-
+                if _WIN32_OK:
+                    _set_cursor(nx, ny)
+                else:
+                    pyautogui.moveTo(nx, ny)
                 if _continuous_action["stop_flag"].wait(cfg["delay"]):
                     break
         finally:
@@ -1480,10 +1293,149 @@ def continuous_move(direction, speed="normal"):
     listen_for_stop_async()
 
 
-# ---- Ollama -----------------------------------------------------------------
+# =============================================================
+#  Wake / Sleep / Exit logic
+# =============================================================
+EXIT_PHRASES = [
+    "rolex exit", "exit rolex", "rolex quit", "quit rolex",
+    "rolex close yourself", "close yourself rolex",
+    "rolex shutdown", "shutdown rolex", "rolex shut down",
+    "rolex close", "close rolex", "rolex goodbye", "goodbye rolex",
+    "rolex terminate", "terminate rolex",
+    "rolex turn off", "turn off rolex",
+    "rolex power off", "power off rolex",
+    "rolex kill yourself", "kill rolex",
+    "rolex bye", "bye rolex",
+    "rolex stop forever", "rolex die",
+]
 
+SLEEP_PHRASES = [
+    "rolex sleep", "sleep rolex", "rolex go to sleep", "go to sleep rolex",
+    "rolex sleep now", "sleep now rolex",
+    "rolex stop listening", "stop listening rolex",
+    "rolex pause", "pause rolex", "rolex pause listening",
+    "rolex sleep mode", "sleep mode rolex",
+    "rolex rest", "rest rolex",
+    "rolex standby", "standby rolex", "rolex stand by",
+    "rolex quiet mode", "quiet mode rolex",
+    "rolex be quiet", "be quiet rolex",
+    "rolex goodnight", "goodnight rolex", "rolex good night", "good night rolex",
+    "rolex night", "night rolex",
+    "rolex take a break", "take a break rolex",
+    "rolex silent", "silent rolex",
+]
+
+
+def has_wake(text):
+    if not text:
+        return False
+    t = text.lower().strip()
+    for w in WAKE_WORDS:
+        if re.search(r"\b" + re.escape(w) + r"\b", t):
+            return True
+        if t == w:
+            return True
+    return False
+
+
+def strip_wake(text):
+    if not text:
+        return ""
+    t = text.lower().strip()
+    sorted_wake = sorted(WAKE_WORDS, key=len, reverse=True)
+
+    for w in sorted_wake:
+        if t.startswith(w + " ") or t == w:
+            remaining = t[len(w):].strip()
+            remaining = remaining.lstrip(",.!?;:")
+            remaining = re.sub(r"^(please|can you|could you|would you|now)\s+", "", remaining)
+            return remaining.strip()
+
+    for w in sorted_wake:
+        if t.endswith(" " + w):
+            remaining = t[:-len(w)].strip()
+            remaining = remaining.rstrip(",.!?;:")
+            return remaining.strip()
+
+    for w in sorted_wake:
+        pattern = r"\b" + re.escape(w) + r"\b"
+        if re.search(pattern, t):
+            new = re.sub(pattern, "", t, count=1).strip()
+            new = re.sub(r"\s+", " ", new)
+            new = new.strip(",.!?;: ")
+            return new
+
+    return t
+
+
+_EXIT_WORDS = ("exit", "quit", "shutdown", "shut down", "terminate", "goodbye",
+               "bye", "kill yourself", "close yourself", "turn off", "power off",
+               "stop forever", "die", "shut yourself down")
+_SCREEN_WORDS = ("click", "press", "tap", "open", "close", "tab", "window", "page",
+                 "button", "link", "menu", "dialog", "save", "file", "search")
+_SLEEP_WORDS = ("go to sleep", "sleep now", "sleep mode", "sleep", "goodnight",
+                "good night", "standby", "stand by", "stop listening",
+                "pause listening", "be quiet", "quiet mode", "silent mode",
+                "take a break", "rest now")
+_MEDIA_WORDS = ("video", "music", "song", "movie", "playback", "media", "volume",
+                "playlist", "the track")
+
+
+def _clean(text):
+    t = text.lower().replace("'", "").replace("\u2019", "")
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", t)).strip()
+
+
+_FILLERS = {"please", "now", "right", "immediately", "rolex", "can", "could",
+            "you", "would", "just", "go", "and", "the", "program", "app",
+            "application", "assistant", "for", "good", "ok", "okay"}
+
+
+def _core_words(rest):
+    return " ".join(w for w in rest.split() if w not in _FILLERS)
+
+
+def is_exit(text):
+    if not text or not has_wake(text):
+        return False
+    rest = _clean(strip_wake(text))
+    if not rest:
+        return False
+    core = _core_words(rest)
+    if core in ("exit", "quit", "shutdown", "shut down", "terminate", "goodbye",
+                "bye", "kill yourself", "close yourself", "turn off", "power off",
+                "stop forever", "die", "shut yourself down"):
+        return True
+    tails = {"the", "program", "app", "application", "yourself", "assistant",
+             "everything", "down", "off", "out", "all", "completely"}
+    for w in _EXIT_WORDS:
+        if re.match(rf"^{re.escape(w)}\b", core):
+            extra = core[len(w):].split()
+            if all(e in tails for e in extra):
+                return True
+    if any(re.search(rf"\b{re.escape(w)}\b", rest) for w in _SCREEN_WORDS):
+        return False
+    return False
+
+
+def is_sleep_command(text):
+    if not text or not has_wake(text):
+        return False
+    rest = _clean(strip_wake(text))
+    if not rest:
+        return False
+    if any(re.search(rf"\b{re.escape(w)}\b", rest) for w in _MEDIA_WORDS):
+        return False
+    if rest in ("pause", "rest", "quiet", "silent"):
+        return True
+    return any(re.search(rf"\b{re.escape(w)}\b", rest) for w in _SLEEP_WORDS)
+
+# =============================================================
+#  Ollama (optional, last resort only)
+# =============================================================
 def ollama_ok():
-    # Cache for 30s to avoid HTTP spam
+    if not ENABLE_LLM:
+        return False
     now = time.time()
     if _ollama_ok_cache["val"] is not None and now - _ollama_ok_cache["time"] < 30:
         return _ollama_ok_cache["val"]
@@ -1499,13 +1451,15 @@ def ollama_ok():
 
 
 def _ask_ollama_raw(prompt):
+    if not ENABLE_LLM:
+        return None
     try:
         import requests
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={"model": OLLAMA_MODEL, "prompt": prompt,
                   "stream": False, "options": {"temperature": 0.1, "num_predict": 30}},
-            timeout=20,
+            timeout=8,
         )
         if resp.status_code == 200:
             return resp.json().get("response", "").strip()
@@ -1528,14 +1482,14 @@ def extract_keyword(command):
     return None
 
 
-# ---- Ollama Command Translator (fallback for unknown commands) ------------
-
+# ---- Ollama command translator (shrunk prompt, 8s timeout) ----
 _translation_cache = {}
 
 TRANSLATIONS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 
+    os.path.dirname(os.path.abspath(__file__)),
     "learned_translations.json"
 )
+
 
 def load_translations():
     global _translation_cache
@@ -1547,6 +1501,7 @@ def load_translations():
     except Exception as e:
         print(f"  [!] Could not load translations: {e}")
 
+
 def save_translations():
     try:
         with open(TRANSLATIONS_FILE, "w", encoding="utf-8") as f:
@@ -1554,152 +1509,44 @@ def save_translations():
     except Exception as e:
         print(f"  [!] Could not save translations: {e}")
 
-# Build the known commands reference ONCE (used in every prompt)
+
 KNOWN_COMMANDS_REFERENCE = """
 KNOWN COMMAND FORMATS (translate user input to ONE of these):
-
-APPS:
-- open chrome
-- open vlc
-- open notepad
-- open calculator
-- open file explorer
-- open settings
-- open youtube
-- open 2nd chrome account
-
-CLICK (on text/words visible on screen):
-- click [word]
-- click on [word]
-- click 2nd [word]
-- click third button
-
-CLICK AT CURSOR POSITION:
-- click here
-- double click
-- right click
-
-MOUSE MOVEMENT:
-- go right
-- go left  
-- go up
-- go down
-- go up right
-- move right half
-- go down a little
-- go up a lot
-- move left 300
-
-SCROLL (MUST include up or down):
-- scroll up
-- scroll down
-- scroll up a lot
-- scroll down a little
-- scroll to top
-- scroll to bottom
-
-NEVER return just "scroll" without a direction.
-
-MEDIA:
-- play
-- pause
-- volume up
-- volume down
-- mute
-- forward
-- backward
-- fullscreen
-
-TABS (browser):
-- go to tab 4
-- next tab
-- previous tab
-- close tab
-- close 3rd tab
-- new tab
-- go to gmail tab
-
-WINDOWS (current window):
-- minimize
-- minimize this
-- maximize
-- maximize this
-- restore this
-- close this
-
-WINDOWS (by app name):
-- minimize chrome
-- minimize 2nd chrome
-- minimize all chrome
-- maximize vlc
-- maximize all vlc
-- restore chrome
-- close chrome
-- close 2nd chrome
-- close all chrome windows
-- switch to chrome
-
-WINDOWS (bulk):
-- minimize all
-- maximize all
-- restore all
-- close all minimized
-- show desktop
-- list windows
-
-TYPE/SEARCH:
-- type [text]
-- search for [query]
-- google [query]
-- search youtube for [query]
-
-KEYBOARD:
-- press enter
-- press escape
-- press tab
-- go back
-- screenshot
-
-GRID:
-- click 2nd video in 3rd row
-- click first image
-
-SELECT:
-- select [word]
-
-CONTINUOUS ACTIONS (run until stop):
-- scroll down until stop
-- scroll up until stop
-- keep scrolling down
-- scroll down continuously
-- move right until stop
-- keep moving down
-- move left continuously
-
-STOP COMMANDS:
-- stop
-- stop it
-- that's enough
-- enough
-
-SLEEP/EXIT:
-- go to sleep
-- exit
-
-MULTI-STEP (complex commands broken into steps):
-- open jersey in movies in file explorer
-- search for cats on youtube in chrome
-- open resume in documents folder
-- minimize chrome and open vlc
-- go to downloads then open the first file
-- open chrome and search for weather
+open chrome | open vlc | open notepad | open calculator | open file explorer
+open settings | open youtube | open 2nd chrome account
+click [word] | click on [word] | click 2nd [word]
+click here | double click | right click
+go right | go left | go up | go down | go up right | go down left
+go up a little | go down a lot | move left 300 | move right half
+scroll up | scroll down | scroll up a lot | scroll down a little
+scroll to top | scroll to bottom
+play | pause | volume up | volume down | mute | forward | backward | fullscreen
+go to tab 4 | next tab | previous tab | close tab | close 3rd tab | new tab
+close this | minimize | maximize | restore this
+minimize chrome | maximize vlc | close chrome | switch to chrome
+minimize all | maximize all | show desktop | list windows
+type [text] | search for [query] | google [query] | search youtube for [query]
+press enter | press escape | press tab | go back | screenshot
+click 2nd video in 3rd row | press ctrl c | press alt f4
+scroll down until stop | move right until stop | stop | exit | go to sleep
 """
 
+
+# Question / chit-chat detection: never worth an LLM round-trip
+_QUESTION_START = (
+    "what ", "whats ", "what's ", "who ", "when ", "where ", "why ", "how ",
+    "is ", "are ", "was ", "were ", "do ", "does ", "did ", "can ", "could ",
+    "would ", "will ", "should ", "tell me ", "explain ", "describe ",
+    "weather ", "time ", "date ", "news ",
+)
+
+
+def looks_like_question(t):
+    tt = t.strip().lower()
+    return tt.endswith("?") or tt.startswith(_QUESTION_START)
+
+
 def ollama_translate_command(user_text):
-    """
-    Send unrecognized command to Ollama with context of known commands.
-    Returns a translated command that matches our parser's known formats.
-    """
     cache_key = user_text.lower().strip()
     if cache_key in _translation_cache:
         cached = _translation_cache[cache_key]
@@ -1709,38 +1556,19 @@ def ollama_translate_command(user_text):
     if not ollama_ok():
         return None
 
-    prompt = f"""You are a command translator for a voice assistant called Rolex. 
-The user said something that doesn't exactly match the known command formats.
-Translate their request into the CLOSEST matching known command.
+    prompt = f"""Translate this voice command into ONE known format.
+Reply with ONLY the translated command, or "unknown".
 
 {KNOWN_COMMANDS_REFERENCE}
 
-CRITICAL RULES:
-1. Reply with ONLY the translated command - no explanation.
-2. NEVER return just "scroll" alone - always include "up" or "down".
-3. If the request is NOT a clear command, reply: unknown
-4. If user wants mouse movement, use "go [direction]" NOT scroll.
-5. If user asks for info/questions (what time, weather, etc), reply: unknown
-6. If the request has nothing to do with any command above, reply: unknown
-7. Do NOT guess - if unclear, reply: unknown
+RULES: never reply with bare "scroll"; if unclear reply "unknown";
+if it's a question, reply "unknown".
 
-Examples:
-User: "take me to the right side"       -> go right
-User: "shift mouse up a bit"            -> go up a little  
-User: "I want to see more content"      -> scroll down
-User: "scroll"                          -> unknown
-User: "move the page"                   -> unknown
-User: "do something"                    -> unknown
-User: "what time is it"                 -> unknown
-User: "how are you"                     -> unknown
-User: "fire up spotify"                 -> open spotify
-User: "quiet down please"               -> volume down
-User: "make this window go away"        -> close this
-User: "jump to the second tab"          -> go to tab 2
-User: "hit the submit button"           -> click submit
-User: "mash it"                         -> click here
+User: "take me to the right"     -> go right
+User: "fire up spotify"          -> open spotify
+User: "make this window go away" -> close this
+User: "what time is it"          -> unknown
 
-Now translate this:
 User: "{user_text}"
 Translated:"""
 
@@ -1748,21 +1576,14 @@ Translated:"""
         import requests
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 25}
-            },
-            timeout=15,
+            json={"model": OLLAMA_MODEL, "prompt": prompt,
+                  "stream": False,
+                  "options": {"temperature": 0.1, "num_predict": 15}},
+            timeout=8,
         )
         if resp.status_code == 200:
             answer = resp.json().get("response", "").strip()
-            # Clean up the response
-            answer = answer.split("\n")[0].strip()
-            answer = answer.strip("\"'.,!?")
-            answer = answer.lower()
-            # Strip common prefixes the model might add
+            answer = answer.split("\n")[0].strip().strip("\"'.,!?").lower()
             for prefix in ("translated:", "command:", "answer:", "->"):
                 if answer.startswith(prefix):
                     answer = answer[len(prefix):].strip()
@@ -1773,23 +1594,24 @@ Translated:"""
                 save_translations()
                 return answer
             else:
-                print(f"  [Ollama Translator] Could not translate")
+                print("  [Ollama Translator] Could not translate")
     except Exception as e:
         print(f"  [!] Translation error: {e}")
 
     return None
 
 
-# ---- Vision -----------------------------------------------------------------
-
+# =============================================================
+#  Vision
+# =============================================================
 _vision_cache = {}
-
-
 _detected_vision_model = None
 
+
 def vision_model_ok():
-    """Detect installed moondream or llava variant dynamically."""
     global _detected_vision_model
+    if not ENABLE_LLM:
+        return False
     now = time.time()
     if _vision_ok_cache["val"] is not None and now - _vision_ok_cache["time"] < 30:
         return _vision_ok_cache["val"]
@@ -1815,55 +1637,51 @@ def vision_model_ok():
 
 
 def find_image_on_screen(description):
-    """Find an image/element on screen using vision model with Redis cache."""
     cache_key_desc = description.lower().strip()
 
-    # ---- Try Redis cache first (much faster) ----
     if _REDIS_AVAILABLE:
-        screen_hash = redis_cache_screenshot_hash()
-        rkey = redis_cache_key("vision", f"{cache_key_desc}:{screen_hash}")
-        cached = redis_get(rkey)
-        if cached is not None:
-            if cached.get("found"):
-                coords = tuple(cached["coords"])
-                print(f"  [Redis Cache] Found \"{description}\" at {coords}")
-                return coords
-            else:
-                print(f"  [Redis Cache] \"{description}\" was not found (cached)")
+        shot = take_screenshot()
+        if shot is not None:
+            screen_hash = _thumb_hash_from_image(shot)
+            rkey = redis_cache_key("vision", f"{cache_key_desc}:{screen_hash}")
+            cached = redis_get(rkey)
+            if cached is not None:
+                if cached.get("found"):
+                    coords = tuple(cached["coords"])
+                    print(f"  [Redis Cache] Found \"{description}\" at {coords}")
+                    return coords
                 return None
+            screenshot = shot
+        else:
+            screenshot = None
+    else:
+        screenshot = None
 
-    # ---- Memory cache fallback ----
     if cache_key_desc in _vision_cache:
         mem = _vision_cache[cache_key_desc]
         if time.time() - mem["time"] < 10:
-            print(f"  [Mem Cache] Using cached result for \"{description}\"")
             return mem["coords"]
 
     print(f"  [Vision] Analyzing screen for: \"{description}\"")
-
-    try:
-        screenshot = pyautogui.screenshot()
-    except Exception as e:
-        print(f"  [!] Screenshot failed: {e}")
+    if screenshot is None:
+        screenshot = take_screenshot()
+    if screenshot is None:
         return None
     screen_w, screen_h = screenshot.size
 
-    # Resize for speed
-    max_dim = 768  # smaller = faster (was 1024)
+    max_dim = 768
     if screen_w > max_dim or screen_h > max_dim:
         ratio = min(max_dim / screen_w, max_dim / screen_h)
-        new_w = int(screen_w * ratio)
-        new_h = int(screen_h * ratio)
+        new_w, new_h = int(screen_w * ratio), int(screen_h * ratio)
         screenshot_small = screenshot.resize((new_w, new_h), Image.LANCZOS)
-        scale_x = screen_w / new_w
-        scale_y = screen_h / new_h
+        scale_x, scale_y = screen_w / new_w, screen_h / new_h
     else:
         screenshot_small = screenshot
         scale_x = scale_y = 1.0
         new_w, new_h = screen_w, screen_h
 
     buf = io.BytesIO()
-    screenshot_small.save(buf, format="JPEG", quality=60)  # lower quality = faster
+    screenshot_small.save(buf, format="JPEG", quality=60)
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
     prompt = (
@@ -1874,48 +1692,34 @@ def find_image_on_screen(description):
         f"If you cannot find it, reply: not found"
     )
 
-    # ---- Send to Ollama (via Redis queue if available) ----
     result_coords = None
-
     try:
         import requests
-
-        # Use async request with shorter timeout
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": _detected_vision_model or OLLAMA_VISION_MODEL,
-                "prompt": prompt,
-                "images": [img_b64],
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 20}
-            },
+            json={"model": _detected_vision_model or OLLAMA_VISION_MODEL,
+                  "prompt": prompt, "images": [img_b64], "stream": False,
+                  "options": {"temperature": 0.1, "num_predict": 20}},
             timeout=25,
         )
         if resp.status_code == 200:
             answer = resp.json().get("response", "").strip()
             print(f"  [Vision] Raw answer: \"{answer}\"")
-
-            if "not found" in answer.lower():
-                result_coords = None
-            else:
+            if "not found" not in answer.lower():
                 coord_match = re.search(r"(\d+)\s*[,;\s]\s*(\d+)", answer)
                 if coord_match:
-                    x = int(coord_match.group(1))
-                    y = int(coord_match.group(2))
-                    real_x = int(x * scale_x)
-                    real_y = int(y * scale_y)
+                    real_x = int(int(coord_match.group(1)) * scale_x)
+                    real_y = int(int(coord_match.group(2)) * scale_y)
                     if 0 <= real_x <= screen_w and 0 <= real_y <= screen_h:
                         result_coords = (real_x, real_y)
                         print(f"  [Vision] Found at ({real_x}, {real_y})")
     except Exception as e:
         print(f"  [!] Vision error: {e}")
 
-    # ---- Store in both caches ----
     _vision_cache[cache_key_desc] = {"coords": result_coords, "time": time.time()}
 
     if _REDIS_AVAILABLE:
-        screen_hash = redis_cache_screenshot_hash()
+        screen_hash = _thumb_hash_from_image(screenshot)
         rkey = redis_cache_key("vision", f"{cache_key_desc}:{screen_hash}")
         if result_coords:
             redis_set(rkey, {"found": True, "coords": list(result_coords)}, ttl=30)
@@ -1926,12 +1730,10 @@ def find_image_on_screen(description):
 
 
 def is_image_query(text):
-    image_words = [
-        "image", "picture", "photo", "icon", "logo", "thumbnail",
-        "avatar", "emoji", "symbol", "graphic", "banner",
-        "the one with", "that looks like", "the picture of",
-        "that has", "showing",
-    ]
+    image_words = ["image", "picture", "photo", "icon", "logo", "thumbnail",
+                   "avatar", "emoji", "symbol", "graphic", "banner",
+                   "the one with", "that looks like", "the picture of",
+                   "that has", "showing"]
     t = text.lower()
     return any(w in t for w in image_words)
 
@@ -1949,8 +1751,9 @@ def extract_image_description(text):
     return t.strip() if t else text
 
 
-# ---- OCR --------------------------------------------------------------------
-
+# =============================================================
+#  OCR
+# =============================================================
 try:
     import winocr as _winocr_module
     _WINOCR_AVAILABLE = True
@@ -1963,36 +1766,43 @@ _ocr_cache = {"words": None, "time": 0}
 _ocr_loop = None
 OCR_CACHE_SECONDS = 1.5
 
+
 def _get_ocr_loop():
-    """Reusable event loop for winocr — avoids 'event loop closed' warnings."""
     global _ocr_loop
     if _ocr_loop is None or _ocr_loop.is_closed():
         _ocr_loop = asyncio.new_event_loop()
     return _ocr_loop
 
-def ocr_screen(force=False):
+
+def ocr_screen(force=False, screenshot=None):
     now = time.time()
     if (not force and _ocr_cache["words"] is not None
             and now - _ocr_cache["time"] < OCR_CACHE_SECONDS):
         return _ocr_cache["words"]
 
-    # Redis cache
+    if screenshot is None:
+        screenshot = take_screenshot()
+    if screenshot is None:
+        return []
+
+    screen_hash = None
     if not force and _REDIS_AVAILABLE:
-        screen_hash = redis_cache_screenshot_hash()
+        screen_hash = _thumb_hash_from_image(screenshot)
         rkey = redis_cache_key("ocr", screen_hash)
         cached = redis_get(rkey)
         if cached is not None:
-            print(f"  [Redis OCR] Using cached OCR ({len(cached)} words)")
+            print(f"  [Redis OCR] cached OCR ({len(cached)} words)")
             _ocr_cache["words"] = cached
             _ocr_cache["time"] = now
             return cached
 
     words = []
     if not _WINOCR_AVAILABLE:
+        _ocr_cache["words"] = words
+        _ocr_cache["time"] = now
         return words
 
     try:
-        screenshot = pyautogui.screenshot()
         loop = _get_ocr_loop()
         result = loop.run_until_complete(
             _winocr_module.recognize_pil(screenshot, lang="en")
@@ -2015,17 +1825,17 @@ def ocr_screen(force=False):
     _ocr_cache["time"] = now
 
     if _REDIS_AVAILABLE and words:
-        screen_hash = redis_cache_screenshot_hash()
-        rkey = redis_cache_key("ocr", screen_hash)
-        redis_set(rkey, words, ttl=10)
+        if screen_hash is None:
+            screen_hash = _thumb_hash_from_image(screenshot)
+        redis_set(redis_cache_key("ocr", screen_hash), words, ttl=10)
 
     return words
+
+
 def find_on_screen(target, occurrence=1, prefer_region=None, force_ocr=False):
-    words = ocr_screen(force=force_ocr)        # ← fresh OCR when requested
+    words = ocr_screen(force=force_ocr)
     if not words:
         return None
-    from difflib import SequenceMatcher
-    import pyautogui
     target_low = target.lower().strip()
     screen_h = pyautogui.size()[1]
     matches = []
@@ -2038,7 +1848,6 @@ def find_on_screen(target, occurrence=1, prefer_region=None, force_ocr=False):
             matches.append((score, w))
     if not matches:
         return None
-    # for "the 2nd X", document order is what the user means - not 2nd best score
     matches.sort(key=lambda m: (m[1]["y"] // 20, m[1]["x"]))
     if prefer_region and len(matches) > 1:
         def bonus(w):
@@ -2048,8 +1857,7 @@ def find_on_screen(target, occurrence=1, prefer_region=None, force_ocr=False):
                 return 0.1
             return 0.0
         matches.sort(key=lambda m: -(m[0] + bonus(m[1])))
-    if occurrence > len(matches):
-        occurrence = len(matches)
+    occurrence = min(occurrence, len(matches))
     w = matches[occurrence - 1][1]
     print(f"  [OK] #{occurrence}: \"{w['text']}\" at ({w['x']},{w['y']})")
     return (w["x"], w["y"])
@@ -2091,35 +1899,234 @@ def find_grid_element(item_type, col_num, row_num=None):
         return (pick["x"], pick["y"])
     return None
 
+# =============================================================
+#  Key name normalization
+# =============================================================
+_KEY_ALIASES = {
+    "page down": "pagedown", "page up": "pageup",
+    "caps lock": "capslock", "num lock": "numlock",
+    "scroll lock": "scrolllock", "print screen": "printscreen",
+    "left arrow": "left", "right arrow": "right",
+    "up arrow": "up", "down arrow": "down",
+    "space bar": "space", "spacebar": "space",
+    "back space": "backspace", "back-space": "backspace",
+    "return": "enter", "esc": "escape",
+    "delete key": "delete", "del": "delete",
+    "windows key": "win", "win key": "win",
+    "control": "ctrl", "ctrl key": "ctrl",
+    "alt key": "alt", "shift key": "shift",
+    "function 1": "f1", "function 2": "f2", "function 3": "f3",
+    "function 4": "f4", "function 5": "f5", "function 6": "f6",
+    "function 7": "f7", "function 8": "f8", "function 9": "f9",
+    "function 10": "f10", "function 11": "f11", "function 12": "f12",
+}
 
-# ---- Command Parser ---------------------------------------------------------
+KEY_NAME_MAP = {
+    "enter": "enter", "return": "enter",
+    "escape": "escape", "esc": "escape",
+    "space": "space", "spacebar": "space",
+    "tab": "tab",
+    "backspace": "backspace", "back space": "backspace",
+    "delete": "delete", "del": "delete",
+    "insert": "insert", "ins": "insert",
+    "home": "home", "end": "end",
+    "page up": "pageup", "pageup": "pageup",
+    "page down": "pagedown", "pagedown": "pagedown",
+    "up": "up", "up arrow": "up", "arrow up": "up",
+    "down": "down", "down arrow": "down", "arrow down": "down",
+    "left": "left", "left arrow": "left", "arrow left": "left",
+    "right": "right", "right arrow": "right", "arrow right": "right",
+    "f1": "f1", "f2": "f2", "f3": "f3", "f4": "f4",
+    "f5": "f5", "f6": "f6", "f7": "f7", "f8": "f8",
+    "f9": "f9", "f10": "f10", "f11": "f11", "f12": "f12",
+    "shift": "shift", "left shift": "shiftleft", "right shift": "shiftright",
+    "control": "ctrl", "ctrl": "ctrl", "left control": "ctrlleft",
+    "alt": "alt", "left alt": "altleft", "right alt": "altright",
+    "windows": "win", "win": "win", "super": "win",
+    "caps lock": "capslock", "caps": "capslock",
+    "num lock": "numlock", "scroll lock": "scrolllock",
+    "print screen": "printscreen", "prtsc": "printscreen",
+    "period": ".", "dot": ".",
+    "comma": ",",
+    "slash": "/", "forward slash": "/",
+    "backslash": "\\", "back slash": "\\",
+    "semicolon": ";", "colon": ":",
+    "quote": "'", "double quote": '"',
+    "dash": "-", "minus": "-", "hyphen": "-",
+    "plus": "+", "equals": "=", "equal": "=",
+    "underscore": "_",
+    "at": "@", "at sign": "@",
+    "hash": "#", "hashtag": "#", "pound": "#",
+    "dollar": "$", "percent": "%",
+    "ampersand": "&", "and sign": "&",
+    "asterisk": "*", "star": "*",
+    "open bracket": "[", "close bracket": "]",
+    "open brace": "{", "close brace": "}",
+    "open paren": "(", "close paren": ")",
+    "tilde": "~", "backtick": "`", "grave": "`",
+    "pipe": "|",
+    "exclamation": "!", "question mark": "?",
+}
 
-def parse_number_words(text):
-    # Check explicit digits first (e.g. "15", "10", "30")
-    m = re.search(r"\b(\d+)\b", text)
+MODIFIER_MAP = {
+    "ctrl": "ctrl", "control": "ctrl",
+    "alt": "alt", "option": "alt",
+    "shift": "shift",
+    "win": "win", "windows": "win", "super": "win", "command": "win",
+    "fn": "fn",
+}
+
+
+def normalize_key_name(name):
+    n = name.lower().strip()
+    if n in _KEY_ALIASES:
+        return _KEY_ALIASES[n]
+    joined = n.replace(" ", "")
+    try:
+        if joined in pyautogui.KEYBOARD_KEYS:
+            return joined
+    except Exception:
+        pass
+    return n
+
+
+def resolve_key_name(spoken):
+    s = spoken.lower().strip()
+    if s in KEY_NAME_MAP:
+        return KEY_NAME_MAP[s]
+    if len(s) == 1 and s.isalpha():
+        return s
+    if len(s) == 1 and s.isdigit():
+        return s
+    m = re.match(r"(?:letter|key)\s+([a-z0-9])", s)
     if m:
-        return int(m.group(1))
-
-    # Strip time units so "15 seconds" doesn't match ordinal "second"
-    clean = re.sub(r"\bseconds?\b|\bsecs?\b", "", text)
-
-    # Word numbers
-    word_map = {
-        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-        "fifteen": 15, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
-        "sixty": 60,
-    }
-    for word, num in word_map.items():
-        if re.search(r"\b" + re.escape(word) + r"\b", clean):
-            return num
-
-    for word, num in ORDINALS.items():
-        if re.search(r"\b" + re.escape(word) + r"\b", clean):
-            return num
-    return None
+        return m.group(1)
+    m = re.match(r"function\s+(\d+)", s)
+    if m:
+        return f"f{m.group(1)}"
+    return s
 
 
+def parse_key_combo(text):
+    t = text.lower().strip()
+    t = t.replace("+", " ").replace("-", " ")
+    t = t.replace(" and ", " ").replace(" plus ", " ").replace(" with ", " ")
+
+    parts = t.split()
+    keys = []
+    modifiers = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if part in MODIFIER_MAP:
+            modifiers.append(MODIFIER_MAP[part])
+        else:
+            resolved = resolve_key_name(part)
+            keys.append(resolved)
+    return modifiers + keys
+
+
+# =============================================================
+#  Tab switching by number
+# =============================================================
+def switch_tab_number(num):
+    try:
+        n = int(num)
+    except Exception:
+        n = 1
+    n = max(1, min(9, n))
+    speak(f"Switching to tab {n}")
+    pyautogui.hotkey("ctrl", str(n))
+
+
+def next_tab():
+    speak("Next tab")
+    pyautogui.hotkey("ctrl", "tab")
+
+
+def prev_tab():
+    speak("Previous tab")
+    pyautogui.hotkey("ctrl", "shift", "tab")
+
+
+def close_nth_tab(num):
+    try:
+        n = int(num)
+    except Exception:
+        n = 1
+    speak(f"Closing tab {n}")
+    pyautogui.hotkey("ctrl", str(n))
+    time.sleep(0.3)
+    pyautogui.hotkey("ctrl", "w")
+
+
+# =============================================================
+#  Context detection
+# =============================================================
+def get_foreground_window_info():
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        cls_buf = ctypes.create_unicode_buffer(256)
+        _user32.GetClassNameW(hwnd, cls_buf, 256)
+        cls = cls_buf.value or ""
+        length = _user32.GetWindowTextLengthW(hwnd)
+        title_buf = ctypes.create_unicode_buffer(length + 1)
+        _user32.GetWindowTextW(hwnd, title_buf, length + 1)
+        title = title_buf.value or ""
+        try:
+            import psutil
+            pid = wintypes.DWORD()
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            proc = psutil.Process(pid.value).name().lower()
+        except Exception:
+            proc = ""
+        return cls.lower(), title.lower(), proc
+    except Exception:
+        return "", "", ""
+
+
+def get_auto_sleep_timeout():
+    try:
+        cls, title, proc = get_foreground_window_info()
+        media_apps = ["vlc", "chrome", "msedge", "firefox", "spotify",
+                      "brave", "opera", "mpv", "mpc-hc"]
+        if any(m in proc for m in media_apps):
+            return 300
+    except Exception:
+        pass
+    return AUTO_SLEEP_TIMEOUT
+
+
+def get_context():
+    cls, title, proc = get_foreground_window_info()
+    browser_procs = ("chrome.exe", "msedge.exe", "firefox.exe",
+                     "brave.exe", "opera.exe", "vivaldi.exe")
+    if any(bp in proc for bp in browser_procs):
+        return "browser"
+    if "chrome_widgetwin" in cls or "mozillawindowclass" in cls:
+        return "browser"
+    if "cabinetwclass" in cls or "explorewclass" in cls:
+        return "explorer"
+    if "progman" in cls or "workerw" in cls:
+        return "desktop"
+    if proc in ("notepad.exe", "notepad++.exe", "code.exe", "sublime_text.exe"):
+        return "editor"
+    return "other"
+
+
+def is_url(text):
+    t = text.lower().strip()
+    if t.startswith(("http://", "https://", "www.")):
+        return True
+    if re.match(r"^[\w-]+\.[a-z]{2,}(/.*)?$", t):
+        return True
+    return False
+
+
+# =============================================================
+#  Command normalization  (THE FIX SECTION)
+# =============================================================
 _SHORTCUTS = [("select all", "ctrl a"), ("copy", "ctrl c"), ("paste", "ctrl v"),
               ("cut", "ctrl x"), ("undo", "ctrl z"), ("redo", "ctrl y"),
               ("save as", "ctrl shift s"), ("save", "ctrl s"), ("find", "ctrl f"),
@@ -2127,7 +2134,6 @@ _SHORTCUTS = [("select all", "ctrl a"), ("copy", "ctrl c"), ("paste", "ctrl v"),
 
 
 def apply_shortcuts(t):
-    """t is the padded lower-case string. Only expand when the word IS the command."""
     for word, combo in _SHORTCUTS:
         t = re.sub(rf"^\s*(?:press\s+|do\s+)?{re.escape(word)}"
                    rf"(?:\s+(?:now|please|it))?\s*$", f" press {combo} ", t)
@@ -2142,63 +2148,98 @@ def apply_path_prepositions(t):
     return t
 
 
+def _strip_polite_wrappers(t):
+    """'can you please open chrome for me' -> ' open chrome '"""
+    t = re.sub(r"^\s*(?:hey\s+)?(?:please|kindly|just)?\s*"
+               r"(?:can you|could you|would you|will you|would you mind|"
+               r"do you want to|i want you to|i need you to)\s+", " ", t)
+    t = re.sub(r"^\s*(?:please|kindly|just)\s+", " ", t)
+    t = re.sub(r"\b(?:please|for me|for me please|now|right now|right away|asap|ok|okay)\s*$", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
 def normalize_command(text):
-    """Expand slang/synonyms into canonical verbs so the parser catches them."""
     t = " " + text.lower().strip() + " "
     t = apply_shortcuts(t)
 
-    # Click here synonyms (must run before click_syn so "click at" doesn't swallow "click at cursor")
-    t = t.replace(" click right here ", " click here ")
-    t = t.replace(" click at mouse ", " click here ")
-    t = t.replace(" click where mouse is ", " click here ")
-    t = t.replace(" click at cursor ", " click here ")
-    t = t.replace(" click at the cursor ", " click here ")
-    t = t.replace(" click where cursor is ", " click here ")
-    t = t.replace(" tap right here ", " click here ")
-    t = t.replace(" tap at cursor ", " click here ")
-    t = t.replace(" tap at mouse ", " click here ")
-    t = t.replace(" just click ", " click here ")
-    t = t.replace(" click it ", " click here ")
-    t = t.replace(" click now ", " click here ")
+    # ---- Polite wrappers off FIRST so real rules can match ----
+    t = _strip_polite_wrappers(t)
 
-    # Click synonyms
-    click_syn = ["click on", "click at", "tap on", "tap at", "press on",
-                 "hit on", "touch", "activate", "trigger", "pick",
-                 "choose on", "select"]
-    for syn in click_syn:
+    # ---- Collapse 'verb (mouse|cursor|pointer) ... direction' ----
+    # "move the mouse to the right" / "slide cursor right" / "drag pointer left"
+    t = re.sub(r"\b(?:move|go|slide|shift|drag|push|pull|bring|place|put)\s+"
+               r"(?:the\s+|this\s+|your\s+)?(?:mouse|cursor|pointer|arrow)\s+"
+               r"(?:towards?\s+|to\s+|toward\s+|onto\s+)?(?:the\s+)?",
+               " move ", t)
+    # "mouse/cursor to the right" (bare subject form)
+    t = re.sub(r"^\s*(?:the\s+)?(?:mouse|cursor|pointer)\s+"
+               r"(?:towards?\s+|to\s+)?(?:the\s+)?"
+               r"(right|left|up|down|up right|up left|down right|down left)\b",
+               r" move \1 ", t)
+
+    # "go to right" -> "go right" (strip stray 'to')
+    t = re.sub(r"\b(go|move|cursor|mouse|shift|slide)\s+to\s+(the\s+)?"
+               r"(right|left|up|down|upper|lower)\b", r"\1 \3", t)
+    t = t.replace(" go to the right ", " go right ")
+    t = t.replace(" go to the left ", " go left ")
+    t = t.replace(" go to the top ", " go up ")
+    t = t.replace(" go to the bottom ", " go down ")
+    t = t.replace(" move to the right ", " move right ")
+    t = t.replace(" move to the left ", " move left ")
+    t = t.replace(" move to the top ", " move up ")
+    t = t.replace(" move to the bottom ", " move down ")
+
+    # ---- Click here synonyms (deduplicated) ----
+    for pat in (" click right here ", " click at mouse ", " click where mouse is ",
+                " click at cursor ", " click at the cursor ", " click where cursor is ",
+                " tap right here ", " tap at cursor ", " tap at mouse ",
+                " just click ", " click it ", " click now "):
+        t = t.replace(pat, " click here ")
+
+    # ---- Click synonyms  (NOTE: 'select' removed - it is its own action) ----
+    for syn in ["click on", "click at", "tap on", "tap at", "press on",
+                "hit on", "touch", "activate", "trigger", "pick", "choose on"]:
         t = t.replace(f" {syn} ", " click ")
 
-    # Open synonyms
-    open_syn = ["bring up", "pull up", "boot up", "fire up", "load up",
-                "load", "launch", "start up", "boot", "fire up"]
-    for syn in open_syn:
+    # ---- Open synonyms ----
+    for syn in ["bring up", "pull up", "boot up", "fire up", "load up",
+                "load", "launch", "start up", "boot"]:
         t = t.replace(f" {syn} ", " open ")
 
-    # Close synonyms
-    close_syn = ["shut", "kill", "terminate", "end", "dismiss", "get rid of",
-                 "remove", "exit out of", "exit"]
-    for syn in close_syn:
+    # ---- Close synonyms ----
+    for syn in ["shut", "terminate", "end", "get rid of",
+                "remove", "exit out of", "exit"]:
         t = t.replace(f" {syn} this ", " close this ")
         t = t.replace(f" {syn} window ", " close window ")
         t = t.replace(f" {syn} tab ", " close tab ")
+    t = t.replace(" shut down ", " close ")       # "shut down chrome" -> "close chrome"
+    t = t.replace(" close down ", " close ")
+    t = t.replace(" turn off ", " close ")        # "turn off vlc" -> "close vlc"
 
-    # Volume synonyms
+    # ---- Volume synonyms ----
     t = t.replace(" turn it up ", " volume up ")
     t = t.replace(" turn it down ", " volume down ")
+    t = t.replace(" turn up the volume ", " volume up ")
+    t = t.replace(" turn down the volume ", " volume down ")
+    t = t.replace(" turn the volume up ", " volume up ")
+    t = t.replace(" turn the volume down ", " volume down ")
+    t = t.replace(" turn up volume ", " volume up ")
+    t = t.replace(" turn down volume ", " volume down ")
+    t = t.replace(" raise the volume ", " volume up ")
+    t = t.replace(" lower the volume ", " volume down ")
+    t = t.replace(" raise volume ", " volume up ")
+    t = t.replace(" lower volume ", " volume down ")
+    t = t.replace(" increase the volume ", " volume up ")
+    t = t.replace(" decrease the volume ", " volume down ")
     t = t.replace(" make it louder ", " volume up ")
     t = t.replace(" make it quieter ", " volume down ")
     t = t.replace(" sound up ", " volume up ")
     t = t.replace(" sound down ", " volume down ")
-    t = t.replace(" raise volume ", " volume up ")
-    t = t.replace(" lower volume ", " volume down ")
     t = t.replace(" crank it ", " volume up ")
     t = t.replace(" silence ", " mute ")
-    t = t.replace(" shut up ", " mute ")
 
-    # Scroll synonyms (STRICT - only exact phrases)
-    # Note: "page down" / "page up" are preserved so parse_command sets amount 15
-
-    # Media synonyms
+    # ---- Media synonyms ----
     t = t.replace(" start playing ", " play ")
     t = t.replace(" start the video ", " play ")
     t = t.replace(" start video ", " play ")
@@ -2210,52 +2251,19 @@ def normalize_command(text):
     t = t.replace(" jump ahead ", " forward ")
     t = t.replace(" go further ", " forward ")
 
-    # Mouse movement synonyms
+    # ---- Mouse movement hints ----
     t = t.replace(" cursor goes ", " move ")
     t = t.replace(" pointer ", " cursor ")
     t = t.replace(" bring cursor ", " move cursor ")
     t = t.replace(" shift cursor ", " move cursor ")
     t = t.replace(" drag cursor ", " move cursor ")
 
-    # "go to right" -> "go right" (strip "to" after move verbs for directions)
-    t = re.sub(r"\b(go|move|cursor|mouse|shift|slide)\s+to\s+(the\s+)?(right|left|up|down|upper|lower)\b",
-               r"\1 \3", t)
+    # ---- Half synonyms ----
+    for syn in [" halfway ", " half way ", " by half ", " fifty percent ",
+                " 50 percent ", " medium amount ", " medium "]:
+        t = t.replace(syn, " half ")
 
-    # "go to the right" patterns
-    t = t.replace(" go to right ", " go right ")
-    t = t.replace(" go to left ", " go left ")
-    t = t.replace(" go to up ", " go up ")
-    t = t.replace(" go to down ", " go down ")
-    t = t.replace(" go to the right ", " go right ")
-    t = t.replace(" go to the left ", " go left ")
-    t = t.replace(" go to the top ", " go up ")
-    t = t.replace(" go to the bottom ", " go down ")
-    t = t.replace(" move to right ", " move right ")
-    t = t.replace(" move to left ", " move left ")
-    t = t.replace(" move to top ", " move up ")
-    t = t.replace(" move to bottom ", " move down ")
-
-    # Half synonyms
-    t = t.replace(" halfway ", " half ")
-    t = t.replace(" half way ", " half ")
-    t = t.replace(" by half ", " half ")
-    t = t.replace(" fifty percent ", " half ")
-    t = t.replace(" 50 percent ", " half ")
-    t = t.replace(" medium amount ", " half ")
-    t = t.replace(" medium ", " half ")
-
-    # Click here synonyms
-    t = t.replace(" click right here ", " click here ")
-    t = t.replace(" click at mouse ", " click here ")
-    t = t.replace(" click where mouse is ", " click here ")
-    t = t.replace(" click at the cursor ", " click here ")
-    t = t.replace(" click where cursor is ", " click here ")
-    t = t.replace(" tap right here ", " click here ")
-    t = t.replace(" just click ", " click here ")
-    t = t.replace(" click it ", " click here ")
-    t = t.replace(" click now ", " click here ")
-
-    # Window state synonyms
+    # ---- Window state synonyms ----
     t = t.replace(" make this small ", " minimize this ")
     t = t.replace(" shrink this ", " minimize this ")
     t = t.replace(" shrink window ", " minimize this ")
@@ -2263,7 +2271,6 @@ def normalize_command(text):
     t = t.replace(" hide this ", " minimize this ")
     t = t.replace(" minimize current window ", " minimize this ")
     t = t.replace(" minimize the window ", " minimize this ")
-
     t = t.replace(" make this big ", " maximize this ")
     t = t.replace(" make it big ", " maximize this ")
     t = t.replace(" make this large ", " maximize this ")
@@ -2274,7 +2281,6 @@ def normalize_command(text):
     t = t.replace(" maximize the window ", " maximize this ")
     t = t.replace(" blow up this window ", " maximize this ")
     t = t.replace(" grow this window ", " maximize this ")
-
     t = t.replace(" un maximize ", " restore this ")
     t = t.replace(" unmax ", " restore this ")
     t = t.replace(" normal size ", " restore this ")
@@ -2284,13 +2290,12 @@ def normalize_command(text):
     # Fullscreen
     t = t.replace(" full screen ", " fullscreen ")
     t = t.replace(" full-screen ", " fullscreen ")
-    t = t.replace(" enlarge ", " fullscreen ")
 
-    # "window" standalone context
+    # window standalone
     t = t.replace(" minimize window ", " minimize this ")
     t = t.replace(" maximize window ", " maximize this ")
 
-    # Continuous action synonyms
+    # ---- Continuous action synonyms ----
     t = t.replace(" until i tell you to stop ", " until stop ")
     t = t.replace(" until i tell you ", " until stop ")
     t = t.replace(" until i say stop ", " until stop ")
@@ -2303,7 +2308,7 @@ def normalize_command(text):
     t = t.replace(" don't stop ", " continuously ")
     t = t.replace(" dont stop ", " continuously ")
 
-    # Stop synonyms  
+    # ---- Stop synonyms ----
     t = t.replace(" cut it out ", " stop ")
     t = t.replace(" quit that ", " stop ")
     t = t.replace(" knock it off ", " stop ")
@@ -2311,64 +2316,59 @@ def normalize_command(text):
     t = t.replace(" thats good ", " stop ")
     t = t.replace(" good enough ", " stop ")
 
-    # Search
+    # ---- Search synonyms ----
     t = t.replace(" look for ", " search for ")
     t = t.replace(" find info on ", " search for ")
     t = t.replace(" find me ", " search for ")
     t = t.replace(" google me ", " google ")
 
-    # Navigation
+    # ---- Navigation ----
     t = t.replace(" previous page ", " go back ")
     t = t.replace(" last page ", " go back ")
     t = t.replace(" undo navigation ", " go back ")
 
-    # Screenshot
+    # ---- Screenshot ----
     t = t.replace(" take picture ", " screenshot ")
     t = t.replace(" capture screen ", " screenshot ")
     t = t.replace(" snap screen ", " screenshot ")
     t = t.replace(" print screen ", " screenshot ")
 
-    # Tab operations
+    # ---- Tabs ----
     t = t.replace(" fresh tab ", " new tab ")
     t = t.replace(" another tab ", " new tab ")
     t = t.replace(" open a tab ", " new tab ")
     t = t.replace(" new window tab ", " new tab ")
 
-    # Keyboard & Key press synonyms
+    # ---- Keyboard synonyms ----
     t = t.replace(" hit enter ", " press enter ")
     t = t.replace(" hit return ", " press enter ")
     t = t.replace(" submit ", " press enter ")
     t = t.replace(" confirm ", " press enter ")
     t = t.replace(" dismiss ", " press escape ")
     t = t.replace(" close dialog ", " press escape ")
-
-    t = t.replace(" press the key ", " press ")
-    t = t.replace(" press the ", " press ")
-    t = t.replace(" push the key ", " press ")
     t = t.replace(" push ", " press ")
     t = t.replace(" smash ", " press ")
     t = t.replace(" strike ", " press ")
-    t = t.replace(" keyboard shortcut ", " press ")
-    t = t.replace(" shortcut ", " press ")
     t = t.replace(" hotkey ", " press ")
     t = t.replace(" key combo ", " press ")
     t = t.replace(" key combination ", " press ")
+    t = t.replace(" shortcut ", " press ")
 
-    # Repeat word variants
+    # ---- Repeat words ----
     t = t.replace(" couple times ", " 2 times ")
     t = t.replace(" couple of times ", " 2 times ")
     t = t.replace(" few times ", " 3 times ")
     t = t.replace(" several times ", " 5 times ")
     t = t.replace(" many times ", " 10 times ")
 
-    # Window management synonyms
+    # ---- Windows ----
     t = t.replace(" show the desktop ", " show desktop ")
     t = t.replace(" hide everything ", " minimize all ")
     t = t.replace(" clear screen ", " minimize all ")
     t = t.replace(" bring back ", " restore ")
     t = t.replace(" what windows are open ", " list windows ")
 
-    # Sleep synonyms (go to sleep mode)
+    # ---- Sleep / exit synonyms ----
     t = t.replace(" take a nap ", " go to sleep ")
     t = t.replace(" nap time ", " go to sleep ")
     t = t.replace(" bedtime ", " go to sleep ")
@@ -2381,8 +2381,7 @@ def normalize_command(text):
     t = t.replace(" don't listen ", " stop listening ")
     t = t.replace(" stop hearing ", " stop listening ")
     t = t.replace(" ignore me ", " stop listening ")
-    
-    # Exit synonyms (close program entirely)
+
     t = t.replace(" close program ", " exit ")
     t = t.replace(" close the program ", " exit ")
     t = t.replace(" close app ", " exit ")
@@ -2396,274 +2395,28 @@ def normalize_command(text):
     t = t.replace(" bye bye ", " goodbye ")
     t = t.replace(" catch you later ", " goodbye ")
 
-    # Multi-step connectors (normalize)
-    t = t.replace(" and after that ", " then ")
-    t = t.replace(" after that ", " then ")
-    t = t.replace(" afterwards ", " then ")
-    t = t.replace(" following that ", " then ")
-    t = t.replace(" once done ", " then ")
-    t = t.replace(" when done ", " then ")
-    t = t.replace(" once that's done ", " then ")
-    t = t.replace(" after this ", " then ")
-    t = t.replace(" subsequently ", " then ")
-    
-    # Folder navigation words (context-aware only)
+    # ---- Multi-step connectors ----
+    for conn in (" and after that ", " after that ", " afterwards ",
+                 " following that ", " once done ", " when done ",
+                 " once that's done ", " after this ", " subsequently "):
+        t = t.replace(conn, " then ")
+
     t = apply_path_prepositions(t)
-    
-    # Path separator
+
     t = t.replace(" slash ", " in ")
     t = t.replace(" backslash ", " in ")
     t = t.replace(" -> ", " in ")
     t = t.replace(" > ", " in ")
 
-    # Handle Rolex-prefixed commands properly
-    # These should NOT be mis-parsed as separate verbs
-    clean_t = t.strip()
-    clean_t = re.sub(r"^rolex\s+", "", clean_t)  # Remove leading "rolex "
-    clean_t = re.sub(r"\s+rolex$", "", clean_t)  # Remove trailing " rolex"
+    # Remove leading/trailing "rolex" (wake word already handled)
+    t = re.sub(r"^\s*rolex\s+", " ", t)
+    t = re.sub(r"\s+rolex\s*$", " ", t)
 
-    return clean_t.strip()
+    return t.strip()
 
-
-# ---- Tab switching by number (Ctrl+1 through Ctrl+9) ----------------------
-def switch_tab_number(num):
-    """Switch to Nth tab using Ctrl+N shortcut (works in Chrome/Edge/Firefox)."""
-    try:
-        n = int(num)
-    except Exception:
-        n = 1
-    if n < 1:
-        n = 1
-    if n > 9:
-        speak("Maximum tab number is 9")
-        n = 9
-    speak(f"Switching to tab {n}")
-    pyautogui.hotkey("ctrl", str(n))
-
-def next_tab():
-    speak("Next tab")
-    pyautogui.hotkey("ctrl", "tab")
-
-def prev_tab():
-    speak("Previous tab")
-    pyautogui.hotkey("ctrl", "shift", "tab")
-
-def close_nth_tab(num):
-    """Switch to Nth tab then close it."""
-    try:
-        n = int(num)
-    except Exception:
-        n = 1
-    speak(f"Closing tab {n}")
-    pyautogui.hotkey("ctrl", str(n))
-    time.sleep(0.3)
-    pyautogui.hotkey("ctrl", "w")
-
-
-# ---- Context detection: what app is currently focused? --------------------
-def get_foreground_window_info():
-    """Returns (class_name, window_title, process_name) of active window."""
-    try:
-        hwnd = _user32.GetForegroundWindow()
-        # Class name
-        cls_buf = ctypes.create_unicode_buffer(256)
-        _user32.GetClassNameW(hwnd, cls_buf, 256)
-        cls = cls_buf.value or ""
-        # Title
-        length = _user32.GetWindowTextLengthW(hwnd)
-        title_buf = ctypes.create_unicode_buffer(length + 1)
-        _user32.GetWindowTextW(hwnd, title_buf, length + 1)
-        title = title_buf.value or ""
-        # Process
-        try:
-            import psutil
-            pid = wintypes.DWORD()
-            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            proc = psutil.Process(pid.value).name().lower()
-        except Exception:
-            proc = ""
-        return cls.lower(), title.lower(), proc
-    except Exception:
-        return "", "", ""
-
-
-# ---- Inactivity Auto-Sleep Configuration -------------------------------------
-AUTO_SLEEP_TIMEOUT = 120  # seconds of inactivity before auto-sleep
-
-def get_auto_sleep_timeout():
-    """Longer timeout if a media player or browser is in the foreground."""
-    try:
-        cls, title, proc = get_foreground_window_info()
-        media_apps = ["vlc", "chrome", "msedge", "firefox", "spotify", "brave", "opera", "mpv", "mpc-hc"]
-        proc_clean = proc.lower().replace(".exe", "") if proc else ""
-        if proc_clean in media_apps or any(m in proc.lower() for m in media_apps):
-            return 300  # 5 minutes during media / browser playback
-    except Exception:
-        pass
-    return AUTO_SLEEP_TIMEOUT  # 2 minutes normally
-
-
-def get_context():
-    """Return one of: 'browser', 'explorer', 'desktop', 'editor', 'other'."""
-    cls, title, proc = get_foreground_window_info()
-    
-    # Browsers
-    browser_procs = ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", 
-                     "opera.exe", "vivaldi.exe")
-    if any(bp in proc for bp in browser_procs):
-        return "browser"
-    if "chrome_widgetwin" in cls or "mozillawindowclass" in cls:
-        return "browser"
-    
-    # File Explorer
-    if "cabinetwclass" in cls or "explorewclass" in cls:
-        return "explorer"
-    
-    # Desktop
-    if "progman" in cls or "workerw" in cls:
-        return "desktop"
-    
-    # Text editors
-    if proc in ("notepad.exe", "notepad++.exe", "code.exe", "sublime_text.exe"):
-        return "editor"
-    
-    return "other"
-
-def is_url(text):
-    """Check if text looks like a URL or domain."""
-    t = text.lower().strip()
-    if t.startswith(("http://", "https://", "www.")):
-        return True
-    # Looks like a domain: word.com, word.org, etc.
-    if re.match(r"^[\w-]+\.[a-z]{2,}(/.*)?$", t):
-        return True
-    return False
-
-
-# ---- Smart context-aware OPEN and SEARCH ----------------------------------
-
-def smart_open(target):
-    """
-    Context-aware 'open' command:
-    1. Known app? -> Launch it
-    2. URL/domain? -> Open in browser
-    3. Browser focused? -> Open in new tab
-    4. File Explorer focused? -> Search for file
-    5. Otherwise? -> Windows search
-    """
-    target = target.strip().rstrip(".").lower()
-    if not target:
-        speak("Open what?")
-        return
-    
-    # 1. Known app
-    if target in APP_MAP:
-        open_app(target)
-        return
-    for key in APP_MAP:
-        if key == target or (len(target) > 3 and target in key) or (len(key) > 3 and key in target):
-            open_app(key)
-            return
-    
-    # 2. URL / domain
-    if is_url(target):
-        speak(f"Opening {target}")
-        import webbrowser
-        url = target if target.startswith(("http://", "https://")) else f"https://{target}"
-        webbrowser.open(url)
-        return
-    
-    # 3. Context-aware
-    ctx = get_context()
-    print(f"  [Context] Active: {ctx}")
-    
-    if ctx == "browser":
-        # Open in new tab with Google search
-        speak(f"Opening {target} in browser")
-        pyautogui.hotkey("ctrl", "t")
-        time.sleep(0.4)
-        pyautogui.typewrite(target, interval=0.02)
-        time.sleep(0.2)
-        pyautogui.press("enter")
-        return
-    
-    if ctx == "explorer":
-        # Focus the search bar in File Explorer and search
-        speak(f"Searching for {target} in Explorer")
-        pyautogui.hotkey("ctrl", "e")  # Focus search box
-        time.sleep(0.4)
-        pyautogui.typewrite(target, interval=0.02)
-        time.sleep(0.2)
-        pyautogui.press("enter")
-        return
-    
-    if ctx == "editor":
-        # Open file dialog
-        speak(f"Opening file {target}")
-        pyautogui.hotkey("ctrl", "o")
-        time.sleep(0.6)
-        pyautogui.typewrite(target, interval=0.02)
-        return
-    
-    # 4. Fallback: Windows start menu search
-    speak(f"Searching Windows for {target}")
-    pyautogui.press("win")
-    time.sleep(1.0)
-    pyautogui.typewrite(target, interval=0.03)
-    time.sleep(1.5)
-    pyautogui.press("enter")
-
-
-def smart_search(query):
-    """
-    Context-aware 'search' command:
-    - Browser focused? -> Search in current tab (address bar) or new tab
-    - File Explorer? -> Search files
-    - Otherwise -> Google search in default browser
-    """
-    query = query.strip().rstrip(".")
-    if not query:
-        speak("Search for what?")
-        return
-    
-    ctx = get_context()
-    print(f"  [Context] Active: {ctx}")
-    
-    if ctx == "browser":
-        # Use address bar to search in current tab
-        speak(f"Searching for {query}")
-        pyautogui.hotkey("ctrl", "l")  # Focus address bar
-        time.sleep(0.3)
-        pyautogui.typewrite(query, interval=0.02)
-        time.sleep(0.2)
-        pyautogui.press("enter")
-        return
-    
-    if ctx == "explorer":
-        speak(f"Searching files for {query}")
-        pyautogui.hotkey("ctrl", "e")
-        time.sleep(0.4)
-        pyautogui.typewrite(query, interval=0.02)
-        time.sleep(0.2)
-        pyautogui.press("enter")
-        return
-    
-    # Default: open Google in browser
-    speak(f"Googling {query}")
-    import webbrowser
-    webbrowser.open(f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}")
-
-
-def smart_search_youtube(query):
-    """Search specifically on YouTube."""
-    query = query.strip().rstrip(".")
-    speak(f"Searching YouTube for {query}")
-    import webbrowser
-    webbrowser.open(f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(query)}")
-
-
-# ---- Multi-Step Command Planner (breaks complex commands into steps) ------
-
+# =============================================================
+#  Multi-step planner
+# =============================================================
 _SIMPLE_STARTS = ("go", "move", "scroll", "cursor", "stop", "press", "type",
                   "next", "previous", "prev", "play", "pause", "volume", "mute",
                   "minimize", "maximize", "restore", "screenshot")
@@ -2671,12 +2424,10 @@ _SIMPLE_STARTS = ("go", "move", "scroll", "cursor", "stop", "press", "type",
 
 def is_multi_step_command(text):
     t = re.sub(r"\s+", " ", text.lower().strip())
-    # hard exclusions first
     if re.search(r"\b(?:next|previous|prev)\s+tab\b", t):
         return False
     if re.search(r"\b(?:go|move)\s+(?:up|down|left|right|up right|down left)\b", t):
         return False
-    # "minimize chrome and open vlc" IS multi-step -> check before the guard
     if re.search(r"\b(?:open|close|minimize|maximize|click|launch)\b.+\band\b.+"
                  r"\b(?:open|close|minimize|maximize|click|launch|play|type)\b", t):
         return True
@@ -2707,20 +2458,15 @@ def is_multi_step_command(text):
 
 
 def plan_steps_with_ollama(user_text):
-    """
-    Send complex command to Ollama to break into sequential steps.
-    Returns list of simple commands that our parser understands.
-    """
     if not ollama_ok():
         return None
-    
+
     ctx = get_context()
     cls, title, proc = get_foreground_window_info()
-    
     context_info = f"Currently active: {ctx}"
     if title:
         context_info += f" (window title: '{title[:50]}')"
-    
+
     prompt = f"""You are a step planner for a voice assistant called Rolex on Windows.
 Break the user's complex command into a numbered list of SIMPLE steps.
 
@@ -2728,61 +2474,15 @@ Break the user's complex command into a numbered list of SIMPLE steps.
 
 CONTEXT: {context_info}
 
-IMPORTANT RULES:
-1. Each step must be ONE simple command from the known commands list above.
-2. Add "wait 1" between steps that need time to load (opening apps, clicking).
-3. Add "wait 2" for apps that take longer to load.
-4. If navigating folders in File Explorer:
-   - First step: open file explorer (if not already open)
-   - Then: click on each folder name one by one
-   - Use "click [foldername]" for each folder
-   - If folder needs double-click, just say "click [foldername]"
-5. If navigating in Chrome/browser:
-   - First step: open chrome (if not already open)  
-   - Then: click address bar or new tab as needed
-   - Then: type URL or search query
-   - Then: press enter
-6. Each step on its own numbered line.
-7. Use "wait N" for pauses (N = seconds).
-8. If a step might fail or be unclear, add "confirm" before it.
-9. Only output the numbered steps, nothing else.
-10. Use ONLY commands from the known commands list.
+RULES:
+1. Each step must be ONE simple command from the list above.
+2. Add "wait 1" between steps that need time to load, "wait 2" for slow apps.
+3. For File Explorer folder navigation: click [foldername] for each folder.
+4. For browser: press ctrl l / press ctrl t, then type [text], then press enter.
+5. Numbered list only, one step per line. No explanations.
 
-FILE EXPLORER FOLDER NAVIGATION:
-- To go into a folder: click [foldername]
-- The system auto-detects File Explorer and double-clicks
-- For path like "Movies > Jersey": click movies, wait 1, click jersey
-
-CHROME NAVIGATION:  
-- To search: press ctrl l, wait 1, type [query], press enter
-- To open URL: press ctrl l, wait 1, type [url], press enter
-- New tab: press ctrl t, wait 1, type [query], press enter
-
-EXAMPLES:
-
-User: "open jersey in movies in file explorer"
-Steps:
-1. open file explorer
-2. wait 2
-3. click movies
-4. wait 1
-5. click jersey
-
-User: "search for cats on youtube in chrome"
-Steps:
-1. open chrome
-2. wait 2
-3. press ctrl t
-4. wait 1
-5. type youtube.com
-6. press enter
-7. wait 2
-8. click search
-9. wait 1
-10. type cats
-11. press enter
-
-User: "open my resume in documents folder"
+EXAMPLE:
+User: "open resume in documents folder"
 Steps:
 1. open file explorer
 2. wait 2
@@ -2790,38 +2490,17 @@ Steps:
 4. wait 1
 5. click resume
 
-User: "minimize chrome and open vlc and play"
-Steps:
-1. minimize chrome
-2. wait 1
-3. open vlc
-4. wait 2
-5. play
-
-User: "go to downloads folder and delete the first file"
-Steps:
-1. open file explorer
-2. wait 2
-3. click downloads
-4. wait 1
-5. click first item
-6. press delete
-
-Now plan this:
 User: "{user_text}"
 Steps:"""
-    
+
     try:
         import requests
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 200}
-            },
-            timeout=30,
+            json={"model": OLLAMA_MODEL, "prompt": prompt,
+                  "stream": False,
+                  "options": {"temperature": 0.1, "num_predict": 150}},
+            timeout=20,
         )
         if resp.status_code == 200:
             answer = resp.json().get("response", "").strip()
@@ -2829,66 +2508,43 @@ Steps:"""
             return parse_plan(answer)
     except Exception as e:
         print(f"  [!] Planner error: {e}")
-    
+
     return None
 
 
 def parse_plan(plan_text):
-    """Parse numbered plan into list of step dicts."""
     steps = []
-    lines = plan_text.strip().split("\n")
-    
-    for line in lines:
+    for line in plan_text.strip().split("\n"):
         line = line.strip()
         if not line:
             continue
-        
-        # Remove numbering: "1. ", "1) ", "- "
         line = re.sub(r"^\d+[\.\)]\s*", "", line)
-        line = re.sub(r"^[-•]\s*", "", line)
-        line = line.strip()
-        
+        line = re.sub(r"^[-•]\s*", "", line).strip()
         if not line:
             continue
-        
-        # Skip meta text
-        skip_words = ["steps:", "plan:", "here", "following", "note:", 
+        skip_words = ["steps:", "plan:", "here", "following", "note:",
                       "explanation", "first,", "the steps"]
         if any(line.lower().startswith(sw) for sw in skip_words):
             continue
-        
-        # Wait command
+
         wait_match = re.match(r"wait\s+(\d+)", line.lower())
         if wait_match:
-            steps.append({
-                "type": "wait",
-                "seconds": int(wait_match.group(1)),
-                "raw": line
-            })
+            steps.append({"type": "wait", "seconds": int(wait_match.group(1)), "raw": line})
             continue
-        
-        # Confirm step (pause and ask user)
+
         if line.lower().startswith("confirm"):
             remaining = re.sub(r"^confirm\s*", "", line, flags=re.IGNORECASE).strip()
-            steps.append({
-                "type": "confirm",
-                "message": remaining or "Should I continue?",
-                "raw": line
-            })
+            steps.append({"type": "confirm",
+                          "message": remaining or "Should I continue?",
+                          "raw": line})
             continue
-        
-        # Regular command step
-        steps.append({
-            "type": "command",
-            "command": line.lower().strip(),
-            "raw": line
-        })
-    
+
+        steps.append({"type": "command", "command": line.lower().strip(), "raw": line})
+
     return steps if steps else None
 
 
 def plan_should_cancel():
-    """Only cancel if a continuous action is actually running and was stopped."""
     try:
         return bool(_continuous_action.get("running")) and \
             _continuous_action["stop_flag"].is_set()
@@ -2897,33 +2553,27 @@ def plan_should_cancel():
 
 
 def execute_plan(steps, user_text=""):
-    """
-    Execute a multi-step plan.
-    Pauses on errors or 'confirm' steps.
-    User can say "skip", "continue", "stop", "cancel".
-    """
     if not steps:
         speak("No steps to execute")
         return
-    
+
     total = len([s for s in steps if s["type"] == "command"])
     cmd_num = 0
-    
+
     speak(f"I'll do this in {total} steps")
     time.sleep(0.3)
-    
-    for i, step in enumerate(steps):
-        # Check if user stopped
+
+    for step in steps:
         if plan_should_cancel():
             speak("Plan cancelled")
             return
-        
+
         if step["type"] == "wait":
             secs = step["seconds"]
             print(f"  [Plan] Waiting {secs}s...")
             time.sleep(secs)
             continue
-        
+
         if step["type"] == "confirm":
             msg = step.get("message", "Should I continue?")
             speak(msg, wait=True)
@@ -2936,20 +2586,16 @@ def execute_plan(steps, user_text=""):
                 if any(w in r for w in ["skip", "next", "pass"]):
                     speak("Skipping")
                     continue
-            # Default: continue
             continue
-        
+
         if step["type"] == "command":
             cmd_num += 1
             cmd = step["command"]
             print(f"\n  [Plan Step {cmd_num}/{total}] {cmd}")
-            
-            # Parse and execute the step
             try:
                 intent = parse_command(cmd, use_fallback=False)
                 action = intent.get("action", "")
-                
-                # Check for unknown/failed parse
+
                 if action == "unknown":
                     speak(f"Step {cmd_num} unclear: {cmd}. Skip or retry?", wait=True)
                     response = listen(timeout=8)
@@ -2968,15 +2614,11 @@ def execute_plan(steps, user_text=""):
                             else:
                                 speak("Still can't understand. Skipping.")
                             continue
-                    # Default: skip
                     continue
-                
-                # Execute the step
+
                 execute(intent)
-                
-                # Brief pause between steps
                 time.sleep(0.3)
-                
+
             except Exception as e:
                 print(f"  [!] Step {cmd_num} failed: {e}")
                 speak(f"Step {cmd_num} failed. Continue or stop?")
@@ -2985,39 +2627,23 @@ def execute_plan(steps, user_text=""):
                     speak("Stopping")
                     return
                 continue
-    
+
     speak("All done!")
     print("  [Plan] All steps completed")
 
 
-# ---- Local planner (instant, no LLM needed for common patterns) -----------
-
 def plan_locally(text):
-    """
-    Try to plan steps WITHOUT calling Ollama.
-    Handles common multi-step patterns directly.
-    Returns list of steps or None.
-    """
     t = normalize_command(text)
     steps = []
     ctx = get_context()
-    
-    # ---- Pattern: "open X in Y in Z" (file explorer navigation) ----
-    # "open jersey in movies in file explorer"
-    # "open resume in documents"
-    # "open song.mp3 in music in D drive"
-    
-    folder_match = re.match(
-        r"(?:open|find|go to|navigate to)\s+(.+?)\s+in\s+(.+)", t)
+
+    folder_match = re.match(r"(?:open|find|go to|navigate to)\s+(.+?)\s+in\s+(.+)", t)
     if folder_match:
         target = folder_match.group(1).strip()
         path = folder_match.group(2).strip()
-        
-        # Split path by "in" to get folder chain
         parts = [p.strip() for p in path.split(" in ")]
-        parts = [p for p in parts if p]  # remove empty
-        
-        # Remove "file explorer" / "explorer" from parts if present
+        parts = [p for p in parts if p]
+
         need_open_explorer = False
         cleaned_parts = []
         for p in parts:
@@ -3025,44 +2651,38 @@ def plan_locally(text):
                 need_open_explorer = True
             else:
                 cleaned_parts.append(p)
-        
-        # If no "file explorer" mentioned but we're not in explorer, open it
+
         if ctx != "explorer" and not need_open_explorer:
             need_open_explorer = True
-        
-        # Build steps
+
         if need_open_explorer:
             steps.append({"type": "command", "command": "open file explorer", "raw": "open file explorer"})
             steps.append({"type": "wait", "seconds": 2, "raw": "wait 2"})
-        
-        # Navigate through each folder
+
         for folder in cleaned_parts:
             folder = folder.strip().rstrip(".")
             if folder in ("folder", "directory", "drive", "disk"):
                 continue
-            # Clean up: "movies folder" -> "movies"
             folder = re.sub(r"\s*(folder|directory|dir)\s*$", "", folder).strip()
             if folder:
                 steps.append({"type": "command", "command": f"click {folder}", "raw": f"click {folder}"})
                 steps.append({"type": "wait", "seconds": 1, "raw": "wait 1"})
-        
-        # Final target
+
         target = re.sub(r"\s*(folder|directory|file)\s*$", "", target).strip()
         if target:
             steps.append({"type": "command", "command": f"click {target}", "raw": f"click {target}"})
-        
+
         return steps if len(steps) > 1 else None
-    
-    # ---- Pattern: "open X and search/type Y" (browser) ----
+
     browser_match = re.match(
         r"(?:open|launch)\s+(\w+)\s+and\s+(?:search\s+for|search|find|look\s+for|type|go\s+to)\s+(.+)", t)
     if browser_match:
         app = browser_match.group(1).strip()
         query = browser_match.group(2).strip()
-        
+
         steps.append({"type": "command", "command": f"open {app}", "raw": f"open {app}"})
         steps.append({"type": "wait", "seconds": 2, "raw": "wait 2"})
-        
+
         if app in ("chrome", "edge", "firefox", "brave", "browser"):
             steps.append({"type": "command", "command": "press ctrl l", "raw": "press ctrl l"})
             steps.append({"type": "wait", "seconds": 1, "raw": "wait 1"})
@@ -3071,37 +2691,31 @@ def plan_locally(text):
         else:
             steps.append({"type": "command", "command": f"type {query}", "raw": f"type {query}"})
             steps.append({"type": "command", "command": "press enter", "raw": "press enter"})
-        
+
         return steps if len(steps) > 1 else None
-    
-    # ---- Pattern: "search for X on Y" (specific site) ----
+
     site_search = re.match(
         r"(?:search\s+for|search|find|look\s+for)\s+(.+?)\s+(?:on|in)\s+(youtube|google|amazon|github|spotify|netflix)", t)
     if site_search:
         query = site_search.group(1).strip()
         site = site_search.group(2).strip()
-        
+
         site_urls = {
-            "youtube": "youtube.com",
-            "google": "google.com",
-            "amazon": "amazon.com",
-            "github": "github.com",
-            "spotify": "open.spotify.com",
-            "netflix": "netflix.com",
+            "youtube": "youtube.com", "google": "google.com", "amazon": "amazon.com",
+            "github": "github.com", "spotify": "open.spotify.com", "netflix": "netflix.com",
         }
         url = site_urls.get(site, f"{site}.com")
-        
+
         if ctx != "browser":
             steps.append({"type": "command", "command": "open chrome", "raw": "open chrome"})
             steps.append({"type": "wait", "seconds": 2, "raw": "wait 2"})
-        
+
         steps.append({"type": "command", "command": "press ctrl t", "raw": "press ctrl t"})
         steps.append({"type": "wait", "seconds": 1, "raw": "wait 1"})
         steps.append({"type": "command", "command": f"type {url}", "raw": f"type {url}"})
         steps.append({"type": "command", "command": "press enter", "raw": "press enter"})
         steps.append({"type": "wait", "seconds": 2, "raw": "wait 2"})
-        
-        # Find and click search box, then type query
+
         if site == "youtube":
             steps.append({"type": "command", "command": "click search", "raw": "click search"})
         else:
@@ -3109,39 +2723,30 @@ def plan_locally(text):
         steps.append({"type": "wait", "seconds": 1, "raw": "wait 1"})
         steps.append({"type": "command", "command": f"type {query}", "raw": f"type {query}"})
         steps.append({"type": "command", "command": "press enter", "raw": "press enter"})
-        
+
         return steps if len(steps) > 1 else None
-    
-    # ---- Pattern: "X then Y then Z" / "X and then Y" ----
+
     if re.search(r"\b(then|and then|after that|afterwards|next)\b", t):
-        # Split by connectors
         parts = re.split(r"\b(?:then|and then|after that|afterwards|next|,\s*then)\b", t)
         parts = [p.strip().rstrip(".").strip() for p in parts if p.strip()]
-        
-        if len(parts) >= 2:
-            for p in parts:
-                if p:
-                    steps.append({"type": "command", "command": p, "raw": p})
-                    steps.append({"type": "wait", "seconds": 1, "raw": "wait 1"})
-            return steps if len(steps) > 1 else None
-    
-    # ---- Pattern: "X and Y and Z" (multiple actions) ----
-    if re.search(r"(open|close|minimize|maximize|click|launch)\s+.+\s+and\s+(open|close|minimize|maximize|click|launch)", t):
-        parts = re.split(r"\s+and\s+", t)
-        parts = [p.strip() for p in parts if p.strip()]
-        
         if len(parts) >= 2:
             for p in parts:
                 steps.append({"type": "command", "command": p, "raw": p})
                 steps.append({"type": "wait", "seconds": 1, "raw": "wait 1"})
             return steps if len(steps) > 1 else None
-    
-    # ---- Pattern: "go to X folder" (in explorer) ----
-    go_folder = re.match(
-        r"(?:go to|navigate to|open)\s+(?:the\s+)?(.+?)\s+folder", t)
+
+    if re.search(r"(open|close|minimize|maximize|click|launch)\s+.+\s+and\s+(open|close|minimize|maximize|click|launch)", t):
+        parts = re.split(r"\s+and\s+", t)
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) >= 2:
+            for p in parts:
+                steps.append({"type": "command", "command": p, "raw": p})
+                steps.append({"type": "wait", "seconds": 1, "raw": "wait 1"})
+            return steps if len(steps) > 1 else None
+
+    go_folder = re.match(r"(?:go to|navigate to|open)\s+(?:the\s+)?(.+?)\s+folder", t)
     if go_folder and ctx == "explorer":
         folder = go_folder.group(1).strip()
-        # Split if multiple folders: "documents then projects"
         folders = re.split(r"\s+(?:then|and then|>|/|\\)\s+", folder)
         for f in folders:
             f = f.strip()
@@ -3149,7 +2754,7 @@ def plan_locally(text):
                 steps.append({"type": "command", "command": f"click {f}", "raw": f"click {f}"})
                 steps.append({"type": "wait", "seconds": 1, "raw": "wait 1"})
         return steps if len(steps) > 1 else None
-    
+
     return None
 
 
@@ -3161,7 +2766,6 @@ _TAB_BARE = re.compile(r"^tab\s+(\d+)$")
 
 
 def parse_tab(text):
-    """Returns ('number', n) | ('name', name) | None"""
     t = re.sub(r"\s+", " ", text.lower().strip())
     for rx in (_TAB_NUM, _TAB_BARE):
         m = rx.search(t)
@@ -3188,7 +2792,6 @@ _RE_GO_BACK = re.compile(r"\b(?:go|browser)\s+back\b|^\s*back\s*$|\bprevious\s+p
 
 
 def safe_last_resort(normalized_text, raw_text):
-    """Return an intent. Never click a whole sentence by accident."""
     clean = normalized_text.strip()
     if len(clean.split()) > 3 or re.match(r"^(the|a|an|is|am|are|was|were)$", clean):
         print(f"  [Unknown] no rule matched: \"{raw_text}\"")
@@ -3196,15 +2799,13 @@ def safe_last_resort(normalized_text, raw_text):
     return {"action": "click_word", "target": clean, "occurrence": 1}
 
 
-
 def extract_repeat(text):
-    """Detect if command has a repeat suffix, e.g. 'scroll down 3 times', 'five times', 'twice'."""
     m_adv = re.search(r"\b(twice|thrice)\s*$", text)
     if m_adv:
         count = 2 if m_adv.group(1) == "twice" else 3
         cleaned = text[:m_adv.start()].strip()
         return cleaned, count
-    m = re.search(r"\b([a-z0-9]+)\s+times?$", text)
+    m = re.search(r"\b([a-z0-9]+)\s+times?\s*$", text)
     if m:
         num_str = m.group(1)
         if num_str.isdigit():
@@ -3217,6 +2818,29 @@ def extract_repeat(text):
             return cleaned, count
     return text, 1
 
+
+def parse_number_words(text):
+    m = re.search(r"\b(\d+)\b", text)
+    if m:
+        return int(m.group(1))
+    clean = re.sub(r"\bseconds?\b|\bsecs?\b", "", text)
+    word_map = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "fifteen": 15, "twenty": 20, "thirty": 30, "forty": 40,
+        "fifty": 50, "sixty": 60,
+    }
+    for word, num in word_map.items():
+        if re.search(r"\b" + re.escape(word) + r"\b", clean):
+            return num
+    for word, num in ORDINALS.items():
+        if re.search(r"\b" + re.escape(word) + r"\b", clean):
+            return num
+    return None
+
+# =============================================================
+#  parse_command
+# =============================================================
 def parse_command(text, use_fallback=True):
     debug_log(f"parse_command input: '{text}'")
     text_norm = normalize_command(text)
@@ -3228,27 +2852,23 @@ def parse_command(text, use_fallback=True):
         intent["repeat"] = repeat
     return intent
 
+
 def _parse_command_impl(t, text=None, use_fallback=True):
     if text is None:
         text = t
-    repeat = 1
 
     def wrap(intent):
         return intent
 
-    # ---- Multi-step command detection (FIRST PRIORITY) ----
+    # ---- Multi-step detection (FIRST, but only genuinely complex ones) ----
     if use_fallback and is_multi_step_command(text):
         print(f"  [Multi-Step] Detected complex command: \"{text}\"")
-        
-        # Try local planner first (instant, no LLM)
         local_plan = plan_locally(text)
         if local_plan:
             print(f"  [Local Plan] {len(local_plan)} steps")
             for s in local_plan:
                 print(f"    -> {s['raw']}")
             return {"action": "execute_plan", "target": text, "steps": local_plan}
-        
-        # Fall back to Ollama planner
         if ollama_ok():
             ollama_plan = plan_steps_with_ollama(text)
             if ollama_plan:
@@ -3256,23 +2876,19 @@ def _parse_command_impl(t, text=None, use_fallback=True):
                 for s in ollama_plan:
                     print(f"    -> {s['raw']}")
                 return {"action": "execute_plan", "target": text, "steps": ollama_plan}
-        
-        # If both fail, try to at least extract the main action
-        print(f"  [Multi-Step] Could not plan, trying as single command")
+        print("  [Multi-Step] Could not plan, trying as single command")
 
-    # Show learned translations
     if t in ("show learned", "list translations", "what have you learned"):
         return {"action": "show_translations", "target": ""}
 
-    # ---- STOP command (highest priority) ----
+    # ---- STOP (highest priority) ----
     if is_stop_command(t):
         return {"action": "stop_continuous", "target": ""}
 
-    # ---- Continuous scroll ("scroll down until I say stop") ----
+    # ---- Continuous scroll ----
     continuous_scroll_match = re.search(
         r"(?:keep\s+)?scroll(?:ing)?\s+(up|down)\s+"
-        r"(?:until|till|while|and keep going|continuously|forever|non-?stop)",
-        t)
+        r"(?:until|till|while|and keep going|continuously|forever|non-?stop)", t)
     if continuous_scroll_match:
         direction = continuous_scroll_match.group(1)
         speed = "normal"
@@ -3282,7 +2898,6 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             speed = "fast"
         return {"action": "continuous_scroll", "target": direction, "speed": speed}
 
-    # "keep scrolling up/down"
     m = re.search(r"keep\s+scroll(?:ing)?\s+(up|down)", t)
     if m:
         speed = "normal"
@@ -3292,20 +2907,17 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             speed = "fast"
         return {"action": "continuous_scroll", "target": m.group(1), "speed": speed}
 
-    # "scroll up/down forever/continuously"
     m = re.search(r"scroll\s+(up|down)\s+(forever|continuously|non-?stop|always)", t)
     if m:
         return {"action": "continuous_scroll", "target": m.group(1), "speed": "normal"}
 
     # ---- Continuous mouse move ----
-    # "move right until I say stop" / "keep moving down"
     continuous_move_match = re.search(
         r"(?:keep\s+)?(?:move|go|moving|going)\s+"
         r"(up right|upper right|up left|upper left|"
         r"down right|lower right|down left|lower left|"
         r"right|left|up|down)\s+"
-        r"(?:until|till|while|and keep going|continuously|forever|non-?stop)",
-        t)
+        r"(?:until|till|while|and keep going|continuously|forever|non-?stop)", t)
     if continuous_move_match:
         direction = continuous_move_match.group(1)
         speed = "normal"
@@ -3315,7 +2927,6 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             speed = "fast"
         return {"action": "continuous_move", "target": direction, "speed": speed}
 
-    # "keep moving right"
     m = re.search(
         r"keep\s+(?:moving|going)\s+"
         r"(up right|upper right|up left|upper left|"
@@ -3329,7 +2940,6 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             speed = "fast"
         return {"action": "continuous_move", "target": m.group(1), "speed": speed}
 
-    # "move right forever" / "move down continuously"
     m = re.search(
         r"(?:move|go)\s+"
         r"(up right|upper right|up left|upper left|"
@@ -3347,31 +2957,43 @@ def _parse_command_impl(t, text=None, use_fallback=True):
         num = ORDINALS.get(word) or (int(word) if word.isdigit() else None)
         if num:
             return {"action": "chrome_account", "target": str(num)}
-    if re.search(r"(?:open|launch|start)\s+(?:the\s+)?(\w+)\s+(?:chrome\s+)?account",
-                  t):
+    if re.search(r"(?:open|launch|start)\s+(?:the\s+)?(\w+)\s+(?:chrome\s+)?account", t):
         m2 = re.search(r"(?:open|launch|start)\s+(?:the\s+)?(\w+)\s+(?:chrome\s+)?account", t)
         word = m2.group(1)
         num = ORDINALS.get(word) or (int(word) if word.isdigit() else None)
         if num:
             return {"action": "chrome_account", "target": str(num)}
 
-    # ---- Tab switching by NUMBER or NAME ----
-    # "go to tab 4" / "open tab 3" / "switch to tab 2" / "tab 5" / "go to 2nd tab"
+    # ---- URL / site navigation ("go to youtube.com", "visit github.com") ----
+    m = re.match(r"(?:go to|open|visit|navigate to|load|browse)\s+(.+)$", t)
+    if m:
+        target = m.group(1).strip().rstrip(".")
+        if is_url(target):
+            return {"action": "open_url", "target": target}
+        site_domains = {
+            "youtube": "https://www.youtube.com", "gmail": "https://mail.google.com",
+            "google": "https://www.google.com", "github": "https://github.com",
+            "maps": "https://maps.google.com", "facebook": "https://www.facebook.com",
+            "twitter": "https://twitter.com", "x": "https://x.com",
+            "instagram": "https://www.instagram.com", "reddit": "https://www.reddit.com",
+            "wikipedia": "https://www.wikipedia.org",
+        }
+        if target in site_domains:
+            return {"action": "open_url", "target": site_domains[target]}
+
+    # ---- Tab switching ----
     tab_res = parse_tab(t)
     if tab_res:
         kind, val = tab_res
         if kind == "number":
             return {"action": "switch_tab_number", "target": str(val)}
-        elif kind == "name":
-            return {"action": "click_tab", "target": val}
+        return {"action": "click_tab", "target": val}
 
-    # "next tab" / "previous tab"
     if re.search(r"\bnext\s+tab\b", t):
         return {"action": "next_tab", "target": ""}
     if re.search(r"\b(previous|prev|last)\s+tab\b", t):
         return {"action": "prev_tab", "target": ""}
 
-    # "close tab" / "close 3rd tab" / "close this tab"
     close_tab_match = re.search(r"close\s+(?:the\s+)?(?:(\w+)\s+)?tab\b", t)
     if close_tab_match:
         word = close_tab_match.group(1)
@@ -3383,10 +3005,7 @@ def _parse_command_impl(t, text=None, use_fallback=True):
                 return {"action": "close_tab", "target": ""}
         return {"action": "close_tab", "target": ""}
 
-    # ---- Click tab by NAME (only if not caught above) ----
-    m = re.search(
-        r"(?:go to|switch to|open|click|jump to)\s+(?:the\s+)?"
-        r"(.+?)\s+tab\b", t)
+    m = re.search(r"(?:go to|switch to|open|click|jump to)\s+(?:the\s+)?(.+?)\s+tab\b", t)
     if m:
         name = m.group(1).strip()
         if name not in ORDINALS and not name.isdigit():
@@ -3396,78 +3015,57 @@ def _parse_command_impl(t, text=None, use_fallback=True):
         return {"action": "click_tab", "target": m.group(1).strip()}
 
     # ---- Taskbar / Window management ----
-
-    # "close all minimized windows"
     if re.search(r"close\s+all\s+minimized", t):
         return {"action": "close_all_minimized", "target": ""}
 
-    # "minimize all [app] windows"
     m = re.search(r"minimize\s+all\s+(\w+)", t)
     if m:
         name = m.group(1).strip()
         if name not in ("windows", "all"):
-            return {"action": "minimize_window_by_name", "target": name,
-                    "occurrence": "all"}
+            return {"action": "minimize_window_by_name", "target": name, "occurrence": "all"}
 
-    # "maximize all [app] windows"
     m = re.search(r"maximize\s+all\s+(\w+)", t)
     if m:
         name = m.group(1).strip()
         if name not in ("windows", "all"):
-            return {"action": "maximize_window_by_name", "target": name,
-                    "occurrence": "all"}
+            return {"action": "maximize_window_by_name", "target": name, "occurrence": "all"}
 
-    # "minimize all" / "show desktop" / "hide all windows"
     if re.search(r"\b(minimize all|show desktop|hide all|hide everything)\b", t):
         return {"action": "minimize_all", "target": ""}
-
-    # "maximize all windows"
     if re.search(r"\bmaximize all\b", t):
         return {"action": "maximize_all", "target": ""}
-
-    # "restore all" / "restore all windows" / "bring back all"
     if re.search(r"(restore all|bring back all|unminimize all|show all)", t):
         return {"action": "restore_all_minimized", "target": ""}
-
-    # "list windows" / "what's open"
     if re.search(r"(list windows|what.?s open|show windows|open windows)", t):
         return {"action": "list_windows", "target": ""}
 
-    # ---- CLOSE windows by name ----
-    # "close all chrome windows"
     m = re.search(r"close\s+all\s+(\w+)(?:\s+windows?)?", t)
     if m:
         name = m.group(1).strip()
         if name not in ("minimized", "windows", "tabs"):
-            return {"action": "close_window_by_name", "target": name,
-                    "occurrence": "all"}
+            return {"action": "close_window_by_name", "target": name, "occurrence": "all"}
+
+    # "close chrome" / "close vlc" / ... (single app name, no ordinal)
+    m = re.match(r"^close\s+(?:the\s+)?(\w+)$", t)
+    if m:
+        name = m.group(1).strip()
+        if name in APP_MAP or name not in ("this", "it", "current", "now",
+                                           "all", "everything", "tab", "window"):
+            return {"action": "close_window_by_name", "target": name, "occurrence": 1}
 
     # "close 2nd chrome" / "close second chrome window"
     m = re.search(r"close\s+(?:the\s+)?(\w+)\s+(\w+?)(?:\s+window)?$", t)
     if m:
-        ord_word = m.group(1)
-        name = m.group(2).strip()
+        ord_word, name = m.group(1), m.group(2).strip()
         num = ORDINALS.get(ord_word) or (int(ord_word) if ord_word.isdigit() else None)
         if num and (name in APP_MAP or (len(name) > 2 and name not in ("window", "tab", "this"))):
-            return {"action": "close_window_by_name", "target": name,
-                    "occurrence": num}
+            return {"action": "close_window_by_name", "target": name, "occurrence": num}
 
-    # ---- MINIMIZE windows ----
-    # "minimize all chrome windows"
-    m = re.search(r"minimize\s+all\s+(\w+)", t)
-    if m:
-        name = m.group(1).strip()
-        if name not in ("windows", "all"):
-            return {"action": "minimize_window_by_name", "target": name,
-                    "occurrence": "all"}
-
-    # "minimize this" / "minimize this window" / "minimize current"
     if "minimize this window" in t or "minimize this" in t:
         return {"action": "minimize_current"}
     if re.search(r"minimize\s+(this|current|it|now)(\s+window)?$", t) or t.strip() == "minimize":
         return {"action": "minimize_current", "target": ""}
 
-    # "minimize chrome" / "minimize 2nd chrome"
     m = re.search(r"minimize\s+(?:the\s+)?(?:(\w+)\s+)?(\w+)(?:\s+window)?$", t)
     if m and "all" not in t:
         ord_word, name = m.group(1), m.group(2)
@@ -3475,23 +3073,11 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             num = 1
             if ord_word:
                 num = ORDINALS.get(ord_word) or (int(ord_word) if ord_word.isdigit() else 1)
-            return {"action": "minimize_window_by_name", "target": name,
-                    "occurrence": num}
+            return {"action": "minimize_window_by_name", "target": name, "occurrence": num}
 
-    # ---- MAXIMIZE windows ----
-    # "maximize all chrome windows"
-    m = re.search(r"maximize\s+all\s+(\w+)", t)
-    if m:
-        name = m.group(1).strip()
-        if name not in ("windows", "all"):
-            return {"action": "maximize_window_by_name", "target": name,
-                    "occurrence": "all"}
-
-    # "maximize this" / "maximize current" / "fullscreen this window"
     if re.search(r"maximize\s+(this|current|it|now)(\s+window)?$", t) or t.strip() == "maximize":
         return {"action": "maximize_current", "target": ""}
 
-    # "maximize chrome" / "maximize 2nd vlc"
     m = re.search(r"maximize\s+(?:the\s+)?(?:(\w+)\s+)?(\w+)(?:\s+window)?$", t)
     if m and "all" not in t:
         ord_word, name = m.group(1), m.group(2)
@@ -3499,15 +3085,12 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             num = 1
             if ord_word:
                 num = ORDINALS.get(ord_word) or (int(ord_word) if ord_word.isdigit() else 1)
-            return {"action": "maximize_window_by_name", "target": name,
-                    "occurrence": num}
+            return {"action": "maximize_window_by_name", "target": name, "occurrence": num}
 
-    # ---- RESTORE windows ----
-    # "restore this" / "restore current window" / "un-maximize"
-    if re.search(r"(restore|un-?maximize|unmaximize)\s+(this|current|it|now)(\s+window)?$", t) or t.strip() in ("restore", "unmaximize", "un-maximize"):
+    if re.search(r"(restore|un-?maximize|unmaximize)\s+(this|current|it|now)(\s+window)?$", t) \
+            or t.strip() in ("restore", "unmaximize", "un-maximize"):
         return {"action": "restore_current", "target": ""}
 
-    # "restore chrome" / "bring back chrome" / "open minimized chrome"
     m = re.search(r"(?:restore|bring back|unminimize|open minimized)\s+(?:the\s+)?(?:(\w+)\s+)?(\w+)", t)
     if m:
         ord_word, name = m.group(1), m.group(2)
@@ -3517,7 +3100,6 @@ def _parse_command_impl(t, text=None, use_fallback=True):
                 num = ORDINALS.get(ord_word) or (int(ord_word) if ord_word.isdigit() else 1)
             return {"action": "restore_window", "target": name, "occurrence": num}
 
-    # "switch to chrome" / "focus chrome" / "activate chrome"
     m = re.search(r"(?:switch to|focus|activate|bring up)\s+(?:the\s+)?(?:(\w+)\s+)?(\w+)(?:\s+window)?", t)
     if m and "tab" not in t:
         ord_word, name = m.group(1), m.group(2)
@@ -3527,35 +3109,30 @@ def _parse_command_impl(t, text=None, use_fallback=True):
                 num = ORDINALS.get(ord_word) or (int(ord_word) if ord_word.isdigit() else 1)
             return {"action": "focus_window", "target": name, "occurrence": num}
 
-    # ---- Open app (strict: must START with open/launch verb) ----
-    for pat in [r"^(?:open|launch|start|run|execute)\s+(.+)$",
-                r"^(?:can you |please )?(?:open|launch|start)\s+(.+)$"]:
+    # ---- Open app (must START with an open verb) ----
+    for pat in [r"^(?:open|launch|start|run|execute)\s+(.+)$"]:
         m = re.match(pat, t)
         if m:
             app = m.group(1).strip().rstrip(".")
-            # DON'T match if the phrase contains "in" or "for" or "about"
-            if any(kw in app for kw in [" in ", " for ", " about ",
-                                          " on ", " of ", " with "]):
+            if any(kw in app for kw in [" in ", " for ", " about ", " on ", " of ", " with "]):
                 break
-            # Skip tab commands (handled above)
             if re.match(r"tab\s+\w+", app) or re.match(r"(?:the\s+)?\w+\s+tab$", app):
                 continue
-            # Skip account commands (handled above)
             if "account" in app and "chrome" in app:
                 continue
+            # URL typed as "open somesite.com"
+            if is_url(app):
+                return {"action": "open_url", "target": app}
             if app in APP_MAP:
                 return wrap({"action": "open_app", "target": app})
-            # Fuzzy match ONLY if it's a short phrase (<=3 words)
             if len(app.split()) <= 3:
                 for key in APP_MAP:
-                    if key == app or (len(key) > 3 and
-                                       (key in app or app in key)):
+                    if key == app or (len(key) > 3 and (key in app or app in key)):
                         return wrap({"action": "open_app", "target": key})
-            # No fuzzy match for longer phrases - treat as unknown
             if len(app.split()) <= 2:
                 return wrap({"action": "open_app", "target": app})
 
-    # "search cats in chrome" / "find X in Y" should go to search
+    # "search cats in chrome"
     m_search_in = re.match(r"^(?:search|find|look up|google)\s+(.+?)\s+in\s+(.+)$", t)
     if m_search_in:
         s_query = m_search_in.group(1).strip()
@@ -3566,7 +3143,6 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             return wrap({"action": "search", "target": s_query})
         return wrap({"action": "search", "target": s_query})
 
-    # Bare app name
     if t in APP_MAP:
         return {"action": "open_app", "target": t}
 
@@ -3575,25 +3151,23 @@ def _parse_command_impl(t, text=None, use_fallback=True):
         return {"action": "play_pause", "target": ""}
 
     # ---- Volume ----
-    if re.search(r"(volume up|increase volume|louder|turn.* up)", t):
+    if re.search(r"(volume up|increase volume|louder|raise (?:the )?volume)", t):
         amount = parse_number_words(t) or 5
         return {"action": "volume_up", "target": str(amount)}
-    if re.search(r"(volume down|decrease volume|quieter|softer|turn.* down)", t):
+    if re.search(r"(volume down|decrease volume|quieter|softer|lower (?:the )?volume)", t):
         amount = parse_number_words(t) or 5
         return {"action": "volume_down", "target": str(amount)}
     if re.search(r"(mute|unmute)", t):
         return {"action": "mute", "target": ""}
 
-    # ---- Browser back (BEFORE media rewind/forward) ----
+    # ---- Browser back (BEFORE media rewind) ----
     if _RE_GO_BACK.search(t):
         return {"action": "go_back", "target": ""}
 
-    # ---- Backward ----
     if _RE_BACKWARD.search(t):
         secs = parse_number_words(t) or 10
         return {"action": "backward", "target": str(secs)}
 
-    # ---- Forward ----
     if _RE_FORWARD.search(t):
         secs = parse_number_words(t) or 10
         return {"action": "forward", "target": str(secs)}
@@ -3602,73 +3176,54 @@ def _parse_command_impl(t, text=None, use_fallback=True):
     if re.search(r"(full.?screen|enter full|exit full)", t):
         return {"action": "fullscreen", "target": ""}
 
-    # ---- Scroll (STRICT - must have scroll word AND direction) ----
-    # Must explicitly say "scroll up" or "scroll down" - NEVER default
+    # ---- Scroll (must say scroll + direction) ----
     scroll_match = re.search(r"\bscroll(?:ing)?\s+(up|down|top|bottom)\b", t)
     if scroll_match:
         direction = scroll_match.group(1)
-        
-        # Determine amount
         scroll_amount = 10
         n = parse_number_words(t)
-        if n and n < 100:  # Sanity check - don't scroll 2024 lines
+        if n and n < 100:
             scroll_amount = n * 2
-        
         if re.search(r"\b(a lot|much|way|lot|lots)\b", t):
             scroll_amount = 40
         elif re.search(r"\b(little|bit|slightly|small|tiny)\b", t):
             scroll_amount = 4
         elif re.search(r"\b(halfway|half way|half)\b", t):
             scroll_amount = 15
-        
-        if direction in ("up", "top"):
-            return {"action": "scroll_up", "target": str(scroll_amount)}
-        else:
-            return {"action": "scroll_down", "target": str(scroll_amount)}
-    
-    # Alternative scroll patterns (strict - must have direction word)
-    # "page down" / "page up"
+        return {"action": "scroll_up" if direction in ("up", "top") else "scroll_down",
+                "target": str(scroll_amount)}
+
     if re.search(r"\bpage\s+down\b", t) and "search" not in t and "find" not in t:
         return {"action": "scroll_down", "target": "15"}
     if re.search(r"\bpage\s+up\b", t) and "search" not in t and "find" not in t:
         return {"action": "scroll_up", "target": "15"}
-    
-    # "scroll to top/bottom"
     if re.search(r"scroll\s+to\s+(?:the\s+)?top", t):
         return {"action": "scroll_up", "target": "100"}
     if re.search(r"scroll\s+to\s+(?:the\s+)?bottom", t):
         return {"action": "scroll_down", "target": "100"}
-    
-    # If "scroll" is said BUT without direction - ask for clarification
-    # DO NOT default to scrolling down
     if re.search(r"\bscroll\b", t) and not re.search(r"(up|down|top|bottom|left|right)", t):
         return {"action": "ask_scroll_direction", "target": ""}
 
-    # ---- Mouse movement ----
-    # "go down" / "go up" / "move right" / "cursor left" = MOVE MOUSE
-    # Modifiers: "half" / "a lot" / "a little" / "by 300"
+    # ---- MOUSE MOVEMENT (tolerates 'mouse'/'cursor' words inside) ----
     move_match = re.search(
-        r"\b(?:move|go|cursor|mouse|come|shift|slide)\s+"
-        r"(?:to\s+)?(?:the\s+)?"
+        r"\b(?:move|go|cursor|mouse|come|shift|slide|drag|bring)\s+"
+        r"(?:(?:the\s+|your\s+|this\s+)?(?:mouse|cursor|pointer)\s+)?"
+        r"(?:(?:to|towards?|onto)\s+)?"
+        r"(?:the\s+)?"
         r"(up right|upper right|up left|upper left|"
         r"down right|lower right|down left|lower left|"
         r"right|left|up|down)"
-        r"(?:\s+(?:by\s+)?(\d+)(?:\s*(?:px|pixels?))?)?",
-        t)
+        r"(?:\s+(?:by\s+)?(\d+)(?:\s*(?:px|pixels?))?)?", t)
     if move_match:
         direction = move_match.group(1)
         pixels = move_match.group(2)
 
         if pixels:
-            # Explicit pixel amount: "move right by 300"
             amount = int(pixels)
         else:
-            # Default amount
             amount = 200
-
-            # Size modifiers (check in priority order)
             if re.search(r"\b(half|halfway|half\s*way)\b", t):
-                amount = 100  # Half of default 200
+                amount = 100
             elif re.search(r"\b(quarter|little bit|tiny bit|small bit)\b", t):
                 amount = 50
             elif re.search(r"\b(a lot|much more|way more|very far|really far|far)\b", t):
@@ -3677,30 +3232,25 @@ def _parse_command_impl(t, text=None, use_fallback=True):
                 amount = 400
             elif re.search(r"\b(little|bit|slightly|small|tiny|short)\b", t):
                 amount = 80
-            elif re.search(r"\b(a lot|much|more|way|big|lot)\b", t):
+            elif re.search(r"\b(lot|much|more|way|big)\b", t):
                 amount = 400
-
-            # Number without "pixels" keyword: "move right 300"
             n = parse_number_words(t)
             if n and n > 20:
                 amount = n
 
-        return {"action": "move_mouse", "target": direction,
-                "amount": amount}
+        return {"action": "move_mouse", "target": direction, "amount": amount}
 
-    # Double click here (check before single click!)
+    # ---- Double / Right / regular click-here ----
     if re.search(r"\bdouble\s*click\s+(here|now|there|this)?\b", t):
         return {"action": "double_click_here", "target": ""}
     if t.strip() in ("double click", "doubleclick", "double tap"):
         return {"action": "double_click_here", "target": ""}
 
-    # Right click here (check before single click!)
     if re.search(r"\bright\s*click\s+(here|now|there|this)?\b", t):
         return {"action": "right_click_here", "target": ""}
     if t.strip() in ("right click", "rightclick"):
         return {"action": "right_click_here", "target": ""}
 
-    # ---- Click here / click at cursor ----
     if re.search(r"\b(click|tap|press)\s+(here|now|there|this|at cursor|at mouse|cursor|mouse)\b", t):
         return {"action": "click_here", "target": ""}
     if t.strip() in ("click", "tap", "press", "click here", "tap here", "do it"):
@@ -3727,69 +3277,56 @@ def _parse_command_impl(t, text=None, use_fallback=True):
         if desc:
             return {"action": "click_image", "target": desc}
 
-    # ---- Key press / Key combos ----
-    # "press ctrl c" / "press control shift s" / "hit alt f4"
-    # MUST come before generic click parsing
-    
-    # "hold shift for 3 seconds"
+    # ---- Key hold ----
     hold_match = re.search(
         r"hold\s+(?:down\s+)?(?:the\s+)?(.+?)(?:\s+for\s+(\d+)\s*(?:seconds?|secs?)?)?$", t)
     if hold_match:
         key = hold_match.group(1).strip()
         duration = int(hold_match.group(2)) if hold_match.group(2) else 2
         return {"action": "hold_key", "target": key, "duration": duration}
-    
-    # "press ctrl c 3 times" / "hit enter 5 times"
+
+    # ---- Press N times ----
     repeat_match = re.search(
         r"(?:press|hit|tap|push)\s+(?:the\s+)?(.+?)\s+(\d+)\s+times?", t)
     if repeat_match:
         combo = repeat_match.group(1).strip()
         times = int(repeat_match.group(2))
-        # Make sure it's not a click command
         if not re.search(r"\b(on|button|word|text|link)\b", combo):
             return {"action": "press_key_repeat", "target": combo, "times": times}
-    
-    # 15. Keys (multi-word aware)
+
+    # ---- Press (multi-word aware) ----
     m = re.match(r"(?:press|hit|tap)\s+(?:the\s+)?(.+?)(?:\s+key)?$", t)
     if m:
         key_phrase = m.group(1).strip()
+        try:
+            keys_ok = pyautogui.KEYBOARD_KEYS
+        except Exception:
+            keys_ok = []
         if (key_phrase in _KEY_ALIASES or
-            key_phrase.replace(" ", "") in pyautogui.KEYBOARD_KEYS or
-            "+" in key_phrase):
+                key_phrase.replace(" ", "") in keys_ok or
+                "+" in key_phrase):
             return wrap({"action": "press_key", "target": key_phrase})
 
-    # "press ctrl shift s" / "press win x" / "hit alt f4" / "press c"
     key_match = re.search(
         r"(?:press|hit|tap|push|type)\s+(?:the\s+)?(?:key\s+)?(.+)", t)
     if key_match:
         combo = key_match.group(1).strip().rstrip(".")
-        
-        # Check if it's actually a key/combo, not a click command
-        # Skip if combo contains words like "on", "button", "the button"
-        if re.search(r"\b(on|button|word|text|link|icon|image)\b", combo):
-            pass  # Let it fall through to click parsing
-        else:
-            # Validate: at least one part should be a recognized key
+        if not re.search(r"\b(on|button|word|text|link|icon|image)\b", combo):
             test_keys = parse_key_combo(combo)
             is_valid_key = False
             for k in test_keys:
                 k_lower = k.lower()
-                if (k_lower in KEY_NAME_MAP or
-                    k_lower in KEY_NAME_MAP.values() or
-                    k_lower in MODIFIER_MAP or
-                    k_lower in MODIFIER_MAP.values() or
-                    (len(k_lower) == 1 and (k_lower.isalpha() or k_lower.isdigit())) or
-                    re.match(r"f\d+", k_lower)):
+                if (k_lower in KEY_NAME_MAP or k_lower in KEY_NAME_MAP.values() or
+                        k_lower in MODIFIER_MAP or k_lower in MODIFIER_MAP.values() or
+                        (len(k_lower) == 1 and (k_lower.isalpha() or k_lower.isdigit())) or
+                        re.match(r"f\d+", k_lower)):
                     is_valid_key = True
                     break
-            
             if is_valid_key:
                 return {"action": "press_key_combo", "target": combo}
-    
-    # Bare key names: "enter" / "escape" / "space" / "f5"
+
     bare_key = t.strip()
-    if bare_key in KEY_NAME_MAP and bare_key not in ("tab",):
-        # "tab" is handled separately for browser tab switching
+    if bare_key in KEY_NAME_MAP and bare_key != "tab":
         return {"action": "press_key_combo", "target": bare_key}
     if re.match(r"^f\d+$", bare_key):
         return {"action": "press_key_combo", "target": bare_key}
@@ -3802,7 +3339,7 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             groups = m.groups()
             if len(groups) == 2 and groups[0] and groups[0] in ORDINALS:
                 occurrence = ORDINALS[groups[0]]
-                target = groups[1].strip().rstrip(".")
+                target = (groups[1] or "").strip().rstrip(".")
             else:
                 occurrence = 1
                 if len(groups) == 2 and groups[0]:
@@ -3819,34 +3356,30 @@ def _parse_command_impl(t, text=None, use_fallback=True):
         return {"action": "select_word", "target": target}
 
     # ---- Type ----
-    m = re.match(r"(?:type|write|enter)\s+(.+)", t)
+    m = re.match(r"(?:type|write|enter text)\s+(.+)", t)
     if m:
         return {"action": "type_text", "target": m.group(1).strip()}
 
-    # ---- Search (context-aware) ----
-    # "search for cats on youtube"
+    # ---- Search ----
     m = re.match(r"(?:search|find|look\s+up)\s+(?:for\s+)?(.+?)\s+on\s+youtube", t)
     if m:
         return {"action": "search_youtube", "target": m.group(1).strip()}
-    
-    # "search youtube for cats"
+
     m = re.match(r"(?:search|find)\s+youtube\s+for\s+(.+)", t)
     if m:
         return {"action": "search_youtube", "target": m.group(1).strip()}
-    
-    # "google xyz" -> always Google in browser
+
     m = re.match(r"google\s+(?:for\s+)?(.+)", t)
     if m:
         return {"action": "google_search", "target": m.group(1).strip()}
-    
-    # "search for X" / "look up X" / "find X" -> context-aware
+
     m = re.match(r"(?:search|find|look\s+up)\s+(?:for\s+)?(.+)", t)
     if m:
         query = m.group(1).strip()
         if not re.match(r"tab\s+\d", query):
             return {"action": "smart_search", "target": query}
 
-    # ---- Window ----
+    # ---- Window / misc ----
     if "close" in t and ("this" in t or "window" in t):
         return {"action": "close_app", "target": ""}
     if "minimize" in t:     return {"action": "minimize_current", "target": ""}
@@ -3854,75 +3387,76 @@ def _parse_command_impl(t, text=None, use_fallback=True):
     if "screenshot" in t:   return {"action": "screenshot", "target": ""}
     if "new tab" in t:      return {"action": "new_tab", "target": ""}
 
-    # ---- Keyboard keys (multi-word aware) ----
     m = re.match(r"(?:press|hit|tap)\s+(?:the\s+)?(.+?)(?:\s+key)?$", t)
     if m:
         key_phrase = m.group(1).strip()
+        try:
+            keys_ok = pyautogui.KEYBOARD_KEYS
+        except Exception:
+            keys_ok = []
         if (key_phrase in _KEY_ALIASES or
-            key_phrase.replace(" ", "") in pyautogui.KEYBOARD_KEYS or
-            "+" in key_phrase):
+                key_phrase.replace(" ", "") in keys_ok or
+                "+" in key_phrase):
             return wrap({"action": "press_key", "target": key_phrase})
 
-    if t in ("enter", "press enter", "return", "confirm", "ok", "okay"):
-        return wrap({"action": "press_key", "target": "enter"})
-    if t in ("escape", "esc", "press escape", "cancel"):
-        return wrap({"action": "press_key", "target": "escape"})
-    if t == "tab" or "press tab" in t:
-        return wrap({"action": "press_key", "target": "tab"})
-    if t in ("page down", "pagedown"):
-        return wrap({"action": "press_key", "target": "pagedown"})
-    if t in ("page up", "pageup"):
-        return wrap({"action": "press_key", "target": "pageup"})
-
-    # Expanded bare words:
-    if t.strip() in ("enter", "confirm", "ok", "okay", "submit"):
+    if t in ("enter", "press enter", "return", "confirm", "ok", "okay", "submit"):
         return {"action": "press_key_combo", "target": "enter"}
-    if t.strip() in ("escape", "cancel", "dismiss"):
+    if t in ("escape", "esc", "press escape", "cancel", "dismiss"):
         return {"action": "press_key_combo", "target": "escape"}
-    if t.strip() == "tab":
+    if t == "tab" or "press tab" in t:
         return {"action": "press_key_combo", "target": "tab"}
+    if t in ("page down", "pagedown"):
+        return {"action": "press_key", "target": "pagedown"}
+    if t in ("page up", "pageup"):
+        return {"action": "press_key", "target": "pageup"}
 
-    # ---- FALLBACK: Ask Ollama to translate ----
-    if use_fallback and ollama_ok():
+    # =================================================
+    #  FALLBACK - the ONLY place the LLM is allowed in,
+    #  and never for questions / chit-chat.
+    # =================================================
+    if looks_like_question(text) or looks_like_question(t):
+        print(f"  [Question] not a screen command: \"{text}\"")
+        return {"action": "unknown", "target": text}
+
+    if use_fallback and ENABLE_LLM and ollama_ok():
         translated = ollama_translate_command(text)
-        
+
         if translated and translated.strip() != text.lower().strip():
-            # VALIDATION: Reject bad translations
-            bad_translations = ["unknown", "scroll", "move", "click", 
+            bad_translations = {"unknown", "scroll", "move", "click",
                                 "press", "open", "nothing", "error",
-                                "none", "", " "]
+                                "none", "", " "}
             if translated.strip() in bad_translations:
-                print(f"  [Fallback] Ollama returned unclear '{translated}' - ignoring")
+                print(f"  [Fallback] rejected unclear translation '{translated}'")
             else:
-                # Check for incomplete scroll commands
-                if translated.strip() == "scroll" or re.match(r"^scroll\s*$", translated):
-                    print(f"  [Fallback] Rejected incomplete scroll command")
-                else:
-                    print(f"  [Fallback] Re-parsing: \"{translated}\"")
-                    result = parse_command(translated, use_fallback=False)
-                    # Only use if it's a valid specific action
-                    if result.get("action") not in ("click_word",):
-                        return result
-                    # If it fell through to click_word, verify the target makes sense
-                    if result.get("target") and len(result.get("target", "")) > 2:
-                        return result
-        
-        # Secondary: keyword extraction (but validate)
+                print(f"  [Fallback] Re-parsing: \"{translated}\"")
+                result = parse_command(translated, use_fallback=False)
+                if result.get("action") not in ("click_word",):
+                    return result
+                if result.get("target") and len(result.get("target", "")) > 2:
+                    return result
+
         kw = extract_keyword(t)
         if kw and kw != text.lower().strip() and len(kw) > 1:
-            # Reject if keyword is a direction word (would cause scroll bug)
             direction_words = ["up", "down", "left", "right", "top", "bottom",
-                              "scroll", "move", "page"]
+                               "scroll", "move", "page"]
             if kw.lower() not in direction_words:
                 if kw in APP_MAP:
                     return {"action": "open_app", "target": kw}
                 return {"action": "click_word", "target": kw, "occurrence": 1}
 
-    # Last resort: safely determine if it's a short click target or unknown
     return safe_last_resort(t, text)
 
+# =============================================================
+#  Actions
+# =============================================================
+def open_url(url):
+    speak(f"Opening {url}")
+    import webbrowser
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    webbrowser.open(url)
 
-# ---- Actions ----------------------------------------------------------------
 
 def open_app(name):
     app = name.lower().strip()
@@ -3949,44 +3483,39 @@ def open_app(name):
             print(f"  [!] Direct launch failed: {e}")
 
     speak(f"Searching for {name}")
-    pyautogui.hotkey("win")
-    time.sleep(1.2)
-    pyautogui.typewrite(name, interval=0.04)
-    time.sleep(2.0)
+    pyautogui.press("win")
+    time.sleep(1.0)
+    pyautogui.typewrite(name, interval=0.03)
+    time.sleep(1.5)
     pyautogui.press("enter")
     time.sleep(0.5)
     speak("Done.")
 
 
 def open_chrome_account(num=None):
-    """Open Chrome. If an account picker appears, click the Nth account."""
     speak("Opening Chrome")
     try:
-        subprocess.Popen(f'start "" "chrome"', shell=True)
+        subprocess.Popen('start "" "chrome"', shell=True)
     except Exception as e:
         print(f"  [!] Chrome launch failed: {e}")
         return
 
     if num is None:
         return
-
     try:
         num = int(num)
     except Exception:
         num = 1
 
     speak(f"Selecting account {num}")
-    # Wait for picker to appear (up to 5s)
-    _ocr_cache["words"] = None  # force fresh OCR
+    _ocr_cache["words"] = None
     found = None
     for _ in range(10):
         time.sleep(0.5)
         words = ocr_screen(force=True)
-        # Look for account picker keywords
         picker_markers = ["choose", "profile", "who", "using", "account",
                           "select", "gmail.com", "@"]
-        has_picker = any(any(mk in w["text"] for mk in picker_markers)
-                          for w in words)
+        has_picker = any(any(mk in w["text"] for mk in picker_markers) for w in words)
         if has_picker:
             found = words
             break
@@ -3995,11 +3524,7 @@ def open_chrome_account(num=None):
         print("  [Chrome] No account picker detected.")
         return
 
-    # Account tiles are usually in a horizontal row. Group by Y, pick row with
-    # most text items, then pick the Nth from left.
     found.sort(key=lambda w: (w["y"], w["x"]))
-
-    # Find clickable account tiles - usually names + @gmail.com text
     emails = [w for w in found if "@" in w["raw"] or "gmail" in w["text"]]
     if emails:
         emails.sort(key=lambda w: w["x"])
@@ -4009,10 +3534,8 @@ def open_chrome_account(num=None):
             smart_click(pick["x"], pick["y"])
             return
 
-    # Fallback: group all tiles in central horizontal band
     screen_h = pyautogui.size()[1]
-    center_band = [w for w in found
-                   if screen_h * 0.25 < w["y"] < screen_h * 0.75]
+    center_band = [w for w in found if screen_h * 0.25 < w["y"] < screen_h * 0.75]
     center_band.sort(key=lambda w: w["x"])
     if num <= len(center_band):
         pick = center_band[num - 1]
@@ -4022,7 +3545,6 @@ def open_chrome_account(num=None):
 
 
 def click_tab_by_name(name):
-    """Find Chrome/browser tab by name and click it."""
     speak(f"Switching to {name} tab")
     words = ocr_screen(force=True)
     if not words:
@@ -4030,7 +3552,6 @@ def click_tab_by_name(name):
         return
 
     screen_w, screen_h = pyautogui.size()
-    # Tabs live in the TOP ~80px strip of the browser
     tab_strip = [w for w in words if w["y"] < 90]
     if not tab_strip:
         tab_strip = [w for w in words if w["y"] < screen_h * 0.1]
@@ -4038,11 +3559,9 @@ def click_tab_by_name(name):
     name_low = name.lower().strip()
     name_parts = name_low.split()
 
-    # Score each tab-strip word
     best = None
     best_score = 0
 
-    # Single word match
     for w in tab_strip:
         if w["text"] == name_low:
             score = 1.0
@@ -4054,7 +3573,6 @@ def click_tab_by_name(name):
             best_score = score
             best = w
 
-    # Multi-word match within tab strip
     if len(name_parts) > 1:
         tab_strip_sorted = sorted(tab_strip, key=lambda w: w["x"])
         texts = [w["text"] for w in tab_strip_sorted]
@@ -4070,7 +3588,6 @@ def click_tab_by_name(name):
         print(f"  [Tab] Found '{best['raw']}' score={best_score:.2f}")
         reliable_click(best["x"], best["y"])
     else:
-        # Last resort: search anywhere on screen (maybe tab bar is lower)
         c = find_on_screen(name, prefer_region="top")
         if c:
             reliable_click(c[0], c[1])
@@ -4086,7 +3603,7 @@ def click_word(word, occurrence=1):
         return
     hw_scroll(-5)
     time.sleep(0.6)
-    coords = find_on_screen(word, occurrence=occurrence, force_ocr=True)  # fresh OCR
+    coords = find_on_screen(word, occurrence=occurrence, force_ocr=True)
     if coords:
         smart_click(*coords)
         return
@@ -4155,18 +3672,112 @@ def grid_click(item_type, col, row=None):
 def type_text(text):
     speak("Typing")
     time.sleep(0.3)
-    # write() handles unicode better than typewrite() for extended ASCII
     try:
         pyautogui.write(text, interval=0.03)
     except Exception:
-        pyautogui.typewrite(text, interval=0.03)
+        try:
+            pyautogui.typewrite(text, interval=0.03)
+        except Exception as e:
+            print(f"  [!] Type error: {e}")
 
 
 def do_search(query):
     speak(f"Searching for {query}")
     import webbrowser
-    # URL-encode the query
     webbrowser.open(f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}")
+
+
+def smart_open(target):
+    target = target.strip().rstrip(".").lower()
+    if not target:
+        speak("Open what?")
+        return
+
+    if target in APP_MAP:
+        open_app(target)
+        return
+    for key in APP_MAP:
+        if key == target or (len(target) > 3 and target in key) or (len(key) > 3 and key in target):
+            open_app(key)
+            return
+
+    if is_url(target):
+        open_url(target)
+        return
+
+    ctx = get_context()
+    print(f"  [Context] Active: {ctx}")
+
+    if ctx == "browser":
+        speak(f"Opening {target} in browser")
+        pyautogui.hotkey("ctrl", "t")
+        time.sleep(0.4)
+        pyautogui.typewrite(target, interval=0.02)
+        time.sleep(0.2)
+        pyautogui.press("enter")
+        return
+
+    if ctx == "explorer":
+        speak(f"Searching for {target} in Explorer")
+        pyautogui.hotkey("ctrl", "e")
+        time.sleep(0.4)
+        pyautogui.typewrite(target, interval=0.02)
+        time.sleep(0.2)
+        pyautogui.press("enter")
+        return
+
+    if ctx == "editor":
+        speak(f"Opening file {target}")
+        pyautogui.hotkey("ctrl", "o")
+        time.sleep(0.6)
+        pyautogui.typewrite(target, interval=0.02)
+        return
+
+    speak(f"Searching Windows for {target}")
+    pyautogui.press("win")
+    time.sleep(0.8)
+    pyautogui.typewrite(target, interval=0.03)
+    time.sleep(1.2)
+    pyautogui.press("enter")
+
+
+def smart_search(query):
+    query = query.strip().rstrip(".")
+    if not query:
+        speak("Search for what?")
+        return
+
+    ctx = get_context()
+    print(f"  [Context] Active: {ctx}")
+
+    if ctx == "browser":
+        speak(f"Searching for {query}")
+        pyautogui.hotkey("ctrl", "l")
+        time.sleep(0.3)
+        pyautogui.typewrite(query, interval=0.02)
+        time.sleep(0.2)
+        pyautogui.press("enter")
+        return
+
+    if ctx == "explorer":
+        speak(f"Searching files for {query}")
+        pyautogui.hotkey("ctrl", "e")
+        time.sleep(0.4)
+        pyautogui.typewrite(query, interval=0.02)
+        time.sleep(0.2)
+        pyautogui.press("enter")
+        return
+
+    speak(f"Googling {query}")
+    import webbrowser
+    webbrowser.open(f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}")
+
+
+def smart_search_youtube(query):
+    query = query.strip().rstrip(".")
+    speak(f"Searching YouTube for {query}")
+    import webbrowser
+    webbrowser.open(f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(query)}")
 
 
 def show_translations():
@@ -4180,22 +3791,44 @@ def show_translations():
     speak(f"I've learned {len(_translation_cache)} translations")
 
 
-# ---- Media (uses direct VK codes - works everywhere) ----------------------
+# ---- Media ----
 def play_pause():
     speak("Play pause")
     press_vk(VK_MEDIA_PLAY)
 
+
 def volume_up(amount=5):
+    try:
+        amount = int(amount)
+    except Exception:
+        amount = 5
     speak(f"Volume up {amount}")
-    press_vk(VK_VOLUME_UP, times=int(amount), delay=0.08)
+    press_vk(VK_VOLUME_UP, times=amount, delay=0.06)
+
 
 def volume_down(amount=5):
+    try:
+        amount = int(amount)
+    except Exception:
+        amount = 5
     speak(f"Volume down {amount}")
-    press_vk(VK_VOLUME_DOWN, times=int(amount), delay=0.08)
+    press_vk(VK_VOLUME_DOWN, times=amount, delay=0.06)
+
 
 def mute_toggle():
     speak("Mute toggle")
     press_vk(VK_VOLUME_MUTE)
+
+
+def media_next():
+    speak("Next track")
+    press_vk(VK_MEDIA_NEXT)
+
+
+def media_prev():
+    speak("Previous track")
+    press_vk(VK_MEDIA_PREV)
+
 
 def forward(secs=10):
     speak(f"Forward {secs} seconds")
@@ -4203,124 +3836,77 @@ def forward(secs=10):
         pyautogui.press("right")
         time.sleep(0.05)
 
+
 def backward(secs=10):
     speak(f"Backward {secs} seconds")
     for _ in range(max(int(secs) // 5, 1)):
         pyautogui.press("left")
         time.sleep(0.05)
 
+
 def fullscreen():
-    """Context-aware fullscreen toggle."""
     ctx = get_context()
     cls, title, proc = get_foreground_window_info()
-    
-    # YouTube in browser: press F
+
     if ctx == "browser" and "youtube" in title:
         speak("Fullscreen")
         pyautogui.press("f")
         return
-    
-    # VLC: press F
     if "vlc" in proc:
         speak("Fullscreen")
         pyautogui.press("f")
         return
-    
-    # Media players that use F for fullscreen
     media_procs = ("vlc.exe", "mpv.exe", "mpc-hc.exe", "mpc-hc64.exe",
                    "potplayer.exe", "potplayermini.exe", "potplayermini64.exe")
     if any(mp in proc for mp in media_procs):
         speak("Fullscreen")
         pyautogui.press("f")
         return
-    
-    # Default: F11 (browsers, most apps)
     speak("Fullscreen")
     pyautogui.press("f11")
 
-# ---- Scroll (BIG - uses mouse wheel directly) -----------------------------
+
+# ---- Scroll ----
 def scroll_up(amount=5):
-    """amount of 5 = ~half a screen, 15 = several screens."""
     speak("Scrolling up")
-    # Each "click" = one wheel notch = ~3 lines. Multiply for noticeable movement.
     hw_scroll(int(amount) * 3)
+
 
 def scroll_down(amount=5):
     speak("Scrolling down")
     hw_scroll(-int(amount) * 3)
 
+
 def ask_scroll_direction():
-    """Ask user which direction to scroll."""
     speak("Scroll up or down?")
 
+
 def handle_unknown(text=""):
-    """Handle commands that couldn't be parsed."""
     print(f"  [Unknown] Could not understand: '{text}'")
     speak("I didn't catch that. Please repeat.")
 
-# Navigation
-def go_back():      speak("Back");          pyautogui.hotkey("alt", "left")
-def close_win():    speak("Closing");       pyautogui.hotkey("alt", "F4")
-def close_tab():    speak("Closed tab");    pyautogui.hotkey("ctrl", "w")
-def new_tab():      speak("New tab");       pyautogui.hotkey("ctrl", "t")
 
-def minimize_win():
-    speak("Minimizing")
-    # Press twice: first restores, second minimizes
-    pyautogui.hotkey("win", "down")
-    time.sleep(0.1)
-    pyautogui.hotkey("win", "down")
-
-def maximize_win(): speak("Maximized");     pyautogui.hotkey("win", "up")
-def press_key(key): press_key_combo(key)
-
-def screenshot():
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"screenshot_{ts}.png")
-    try:
-        pyautogui.screenshot().save(p)
-        speak("Screenshot saved.")
-    except Exception as e:
-        print(f"  [!] Screenshot error: {e}")
-        speak("Could not take screenshot.")
+def go_back():
+    speak("Back")
+    pyautogui.hotkey("alt", "left")
 
 
-# ---- Universal Key Press System -------------------------------------------
+def close_win():
+    speak("Closing")
+    pyautogui.hotkey("alt", "f4")
 
-# Map spoken key names to pyautogui key names
 
-# ---- Key name normalization (handles multi-word keys) ---------------------
-_KEY_ALIASES = {
-    "page down": "pagedown", "page up": "pageup",
-    "caps lock": "capslock", "num lock": "numlock",
-    "scroll lock": "scrolllock", "print screen": "printscreen",
-    "left arrow": "left", "right arrow": "right",
-    "up arrow": "up", "down arrow": "down",
-    "space bar": "space", "spacebar": "space",
-    "back space": "backspace", "back-space": "backspace",
-    "return": "enter", "esc": "escape",
-    "delete key": "delete", "del": "delete",
-    "windows key": "win", "win key": "win",
-    "control": "ctrl", "ctrl key": "ctrl",
-    "alt key": "alt", "shift key": "shift",
-    "function 1": "f1", "function 2": "f2", "function 3": "f3",
-    "function 4": "f4", "function 5": "f5", "function 6": "f6",
-    "function 7": "f7", "function 8": "f8", "function 9": "f9",
-    "function 10": "f10", "function 11": "f11", "function 12": "f12",
-}
+def close_tab():
+    speak("Closed tab")
+    pyautogui.hotkey("ctrl", "w")
 
-def normalize_key_name(name):
-    """Convert spoken key names to pyautogui-compatible keys."""
-    n = name.lower().strip()
-    if n in _KEY_ALIASES:
-        return _KEY_ALIASES[n]
-    joined = n.replace(" ", "")
-    if joined in pyautogui.KEYBOARD_KEYS:
-        return joined
-    return n
+
+def new_tab():
+    speak("New tab")
+    pyautogui.hotkey("ctrl", "t")
+
 
 def press_key(key_name):
-    """Press one key, or a combo like 'ctrl+shift+t'."""
     key_name = key_name.strip()
     if "+" in key_name:
         parts = [normalize_key_name(p) for p in key_name.split("+")]
@@ -4331,158 +3917,19 @@ def press_key(key_name):
         speak(f"Key {normalized}")
         pyautogui.press(normalized)
 
-KEY_NAME_MAP = {
-    # Letters (a-z handled automatically)
-    # Numbers (0-9 handled automatically)
-    
-    # Special keys
-    "enter": "enter", "return": "enter",
-    "escape": "escape", "esc": "escape",
-    "space": "space", "spacebar": "space",
-    "tab": "tab",
-    "backspace": "backspace", "back space": "backspace",
-    "delete": "delete", "del": "delete",
-    "insert": "insert", "ins": "insert",
-    "home": "home", "end": "end",
-    "page up": "pageup", "pageup": "pageup",
-    "page down": "pagedown", "pagedown": "pagedown",
-    
-    # Arrow keys
-    "up": "up", "up arrow": "up", "arrow up": "up",
-    "down": "down", "down arrow": "down", "arrow down": "down",
-    "left": "left", "left arrow": "left", "arrow left": "left",
-    "right": "right", "right arrow": "right", "arrow right": "right",
-    
-    # Function keys
-    "f1": "f1", "f2": "f2", "f3": "f3", "f4": "f4",
-    "f5": "f5", "f6": "f6", "f7": "f7", "f8": "f8",
-    "f9": "f9", "f10": "f10", "f11": "f11", "f12": "f12",
-    
-    # Modifier keys (standalone press)
-    "shift": "shift", "left shift": "shiftleft", "right shift": "shiftright",
-    "control": "ctrl", "ctrl": "ctrl", "left control": "ctrlleft",
-    "alt": "alt", "left alt": "altleft", "right alt": "altright",
-    "windows": "win", "win": "win", "super": "win",
-    "caps lock": "capslock", "caps": "capslock",
-    "num lock": "numlock", "scroll lock": "scrolllock",
-    "print screen": "printscreen", "prtsc": "printscreen",
-    
-    # Punctuation
-    "period": ".", "dot": ".",
-    "comma": ",",
-    "slash": "/", "forward slash": "/",
-    "backslash": "\\", "back slash": "\\",
-    "semicolon": ";", "colon": ":",
-    "quote": "'", "double quote": '"',
-    "dash": "-", "minus": "-", "hyphen": "-",
-    "plus": "+", "equals": "=", "equal": "=",
-    "underscore": "_",
-    "at": "@", "at sign": "@",
-    "hash": "#", "hashtag": "#", "pound": "#",
-    "dollar": "$", "percent": "%",
-    "ampersand": "&", "and sign": "&",
-    "asterisk": "*", "star": "*",
-    "open bracket": "[", "close bracket": "]",
-    "open brace": "{", "close brace": "}",
-    "open paren": "(", "close paren": ")",
-    "tilde": "~", "backtick": "`", "grave": "`",
-    "pipe": "|",
-    "exclamation": "!", "question mark": "?",
-}
-
-# Modifier key aliases
-MODIFIER_MAP = {
-    "ctrl": "ctrl", "control": "ctrl",
-    "alt": "alt", "option": "alt",
-    "shift": "shift",
-    "win": "win", "windows": "win", "super": "win", "command": "win",
-    "fn": "fn",
-}
-
-
-def resolve_key_name(spoken):
-    """Convert spoken key name to pyautogui key name."""
-    s = spoken.lower().strip()
-    
-    # Direct map
-    if s in KEY_NAME_MAP:
-        return KEY_NAME_MAP[s]
-    
-    # Single letter
-    if len(s) == 1 and s.isalpha():
-        return s
-    
-    # Single digit
-    if len(s) == 1 and s.isdigit():
-        return s
-    
-    # "letter a" / "key b"
-    m = re.match(r"(?:letter|key)\s+([a-z0-9])", s)
-    if m:
-        return m.group(1)
-    
-    # Function key: "function 5" -> "f5"
-    m = re.match(r"function\s+(\d+)", s)
-    if m:
-        return f"f{m.group(1)}"
-    
-    return s  # Return as-is, let pyautogui handle it
-
-
-def parse_key_combo(text):
-    """
-    Parse key combination from text.
-    Returns list of keys to press simultaneously.
-    
-    Examples:
-    - "ctrl c"          -> ["ctrl", "c"]
-    - "control shift s" -> ["ctrl", "shift", "s"]
-    - "win x"           -> ["win", "x"]
-    - "alt f4"          -> ["alt", "f4"]
-    - "c"               -> ["c"]
-    """
-    t = text.lower().strip()
-    
-    # Normalize separators: "ctrl+c", "ctrl-c", "ctrl and c"
-    t = t.replace("+", " ")
-    t = t.replace("-", " ")
-    t = t.replace(" and ", " ")
-    t = t.replace(" plus ", " ")
-    t = t.replace(" with ", " ")
-    
-    parts = t.split()
-    keys = []
-    modifiers = []
-    
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        if part in MODIFIER_MAP:
-            modifiers.append(MODIFIER_MAP[part])
-        else:
-            resolved = resolve_key_name(part)
-            keys.append(resolved)
-    
-    # Modifiers first, then regular keys
-    return modifiers + keys
-
 
 def press_key_combo(combo_text):
-    """Press a key or key combination."""
     keys = parse_key_combo(combo_text)
     if not keys:
         speak("No key recognized")
         return
-    
     if len(keys) == 1:
-        key = keys[0]
-        speak(f"Pressing {key}")
+        speak(f"Pressing {keys[0]}")
         try:
-            pyautogui.press(key)
+            pyautogui.press(keys[0])
         except Exception as e:
             print(f"  [!] Key press error: {e}")
-            speak(f"Cannot press {key}")
+            speak(f"Cannot press {keys[0]}")
     else:
         combo_name = " + ".join(keys)
         speak(f"Pressing {combo_name}")
@@ -4491,21 +3938,17 @@ def press_key_combo(combo_text):
         except Exception as e:
             print(f"  [!] Hotkey error: {e}")
             speak(f"Cannot press {combo_name}")
-    
     print(f"  [Key] Pressed: {keys}")
 
 
 def press_key_repeat(combo_text, times=1):
-    """Press a key or combo multiple times."""
     keys = parse_key_combo(combo_text)
     if not keys:
         speak("No key recognized")
         return
-    
     combo_name = " + ".join(keys)
     speak(f"Pressing {combo_name} {times} times")
-    
-    for i in range(times):
+    for i in range(int(times)):
         try:
             if len(keys) == 1:
                 pyautogui.press(keys[0])
@@ -4515,12 +3958,10 @@ def press_key_repeat(combo_text, times=1):
         except Exception as e:
             print(f"  [!] Key press error on iteration {i+1}: {e}")
             break
-    
     print(f"  [Key] Pressed {keys} x{times}")
 
 
 def hold_key(key_name, duration=2):
-    """Hold a key down for a duration."""
     key = resolve_key_name(key_name)
     speak(f"Holding {key}")
     try:
@@ -4535,80 +3976,86 @@ def hold_key(key_name, duration=2):
             pass
 
 
+def screenshot():
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"screenshot_{ts}.png")
+    try:
+        pyautogui.screenshot().save(p)
+        speak("Screenshot saved.")
+    except Exception as e:
+        print(f"  [!] Screenshot error: {e}")
+        speak("Could not take screenshot.")
+
+
 def execute(intent):
     action = intent.get("action", "")
     target = intent.get("target", "")
     repeat = intent.get("repeat", 1)
 
-    # LOG every action for debugging
-    print(f"  [EXECUTE] action='{action}' target='{target}' repeat={repeat} intent={intent}")
+    print(f"  [EXECUTE] action='{action}' target='{target}' repeat={repeat}")
 
-    # Handle multi-step plans separately
     if action == "execute_plan":
-        steps = intent.get("steps", [])
-        execute_plan(steps, target)
+        execute_plan(intent.get("steps", []), target)
         return
 
     action_map = {
-        "open_app":       lambda: open_app(target),
-        "smart_open":     lambda: smart_open(target),
-        "chrome_account": lambda: open_chrome_account(target),
-        "click_tab":      lambda: click_tab_by_name(target),
+        "open_app":          lambda: open_app(target),
+        "smart_open":        lambda: smart_open(target),
+        "open_url":          lambda: open_url(target),
+        "chrome_account":    lambda: open_chrome_account(target),
+        "click_tab":         lambda: click_tab_by_name(target),
         "switch_tab_number": lambda: switch_tab_number(target),
-        "next_tab":       next_tab,
-        "prev_tab":       prev_tab,
-        "close_nth_tab":  lambda: close_nth_tab(target),
-        # Current window
-        "minimize_current":  minimize_current,
-        "maximize_current":  maximize_current,
-        "restore_current":   restore_current,
-
-        # Named windows
-        "close_window_by_name": lambda: close_window_by_name(target, intent.get("occurrence", 1)),
+        "next_tab":          next_tab,
+        "prev_tab":          prev_tab,
+        "close_nth_tab":     lambda: close_nth_tab(target),
+        "minimize_current":      minimize_current,
+        "maximize_current":      maximize_current,
+        "restore_current":       restore_current,
+        "close_window_by_name":  lambda: close_window_by_name(target, intent.get("occurrence", 1)),
         "minimize_window_by_name": lambda: minimize_window_by_name(target, intent.get("occurrence", 1)),
         "maximize_window_by_name": lambda: maximize_window_by_name(target, intent.get("occurrence", 1)),
         "restore_window":    lambda: restore_window_by_name(target, intent.get("occurrence", 1)),
-
-        # Bulk operations
         "minimize_all":          minimize_all_windows,
         "maximize_all":          maximize_all_windows,
         "restore_all_minimized": restore_all_minimized,
         "close_all_minimized":   close_all_minimized,
-        "focus_window":   lambda: click_taskbar_icon(target, intent.get("occurrence", 1)),
-        "list_windows":   list_open_windows,
-        "move_mouse":     lambda: move_mouse(target, intent.get("amount", 200)),
+        "focus_window":      lambda: click_taskbar_icon(target, intent.get("occurrence", 1)),
+        "list_windows":      list_open_windows,
+        "move_mouse":        lambda: move_mouse(target, intent.get("amount", 200)),
         "click_here":        click_here,
         "double_click_here": double_click_here,
         "right_click_here":  right_click_here,
-        "click_word":     lambda: click_word(target, intent.get("occurrence", 1)),
-        "click_image":  lambda: click_image(target),
-        "select_word":  lambda: select_word(target),
-        "grid_click":   lambda: grid_click(target, intent.get("col", 1), intent.get("row")),
-        "type_text":    lambda: type_text(target),
-        "search":       lambda: do_search(target),
-        "smart_search": lambda: smart_search(target),
-        "google_search": lambda: do_search(target),
-        "search_youtube": lambda: smart_search_youtube(target),
-        "play_pause":   play_pause,
-        "volume_up":    lambda: volume_up(int(target) if target else 5),
-        "volume_down":  lambda: volume_down(int(target) if target else 5),
-        "mute":         mute_toggle,
-        "forward":      lambda: forward(int(target) if target else 10),
-        "backward":     lambda: backward(int(target) if target else 10),
-        "fullscreen":   fullscreen,
-        "scroll_up":    lambda: scroll_up(int(target) if target else 5),
-        "scroll_down":  lambda: scroll_down(int(target) if target else 5),
+        "click_word":        lambda: click_word(target, intent.get("occurrence", 1)),
+        "click_image":       lambda: click_image(target),
+        "select_word":       lambda: select_word(target),
+        "grid_click":        lambda: grid_click(target, intent.get("col", 1), intent.get("row")),
+        "type_text":         lambda: type_text(target),
+        "search":            lambda: do_search(target),
+        "smart_search":      lambda: smart_search(target),
+        "google_search":     lambda: do_search(target),
+        "search_youtube":    lambda: smart_search_youtube(target),
+        "play_pause":        play_pause,
+        "volume_up":         lambda: volume_up(int(target) if str(target).isdigit() else 5),
+        "volume_down":       lambda: volume_down(int(target) if str(target).isdigit() else 5),
+        "mute":              mute_toggle,
+        "media_next":        media_next,
+        "media_prev":        media_prev,
+        "forward":           lambda: forward(int(target) if str(target).isdigit() else 10),
+        "backward":          lambda: backward(int(target) if str(target).isdigit() else 10),
+        "fullscreen":        fullscreen,
+        "scroll_up":         lambda: scroll_up(int(target) if str(target).isdigit() else 5),
+        "scroll_down":       lambda: scroll_down(int(target) if str(target).isdigit() else 5),
         "ask_scroll_direction": ask_scroll_direction,
-        "unknown":       lambda: handle_unknown(target),
-        "go_back":      go_back,
-        "close_app":    close_win,
-        "close_tab":    close_tab,
-        "new_tab":      new_tab,
-        "press_key": lambda: press_key(target),
-        "press_key_combo":  lambda: press_key_combo(target),
-        "press_key_repeat": lambda: press_key_repeat(target, intent.get("times", 1)),
-        "hold_key":         lambda: hold_key(target, intent.get("duration", 2)),
-        "screenshot":   screenshot,
+        "unknown":           lambda: handle_unknown(target),
+        "go_back":           go_back,
+        "close_app":         close_win,
+        "close_tab":         close_tab,
+        "new_tab":           new_tab,
+        "press_key":         lambda: press_key(target),
+        "press_key_combo":   lambda: press_key_combo(target),
+        "press_key_repeat":  lambda: press_key_repeat(target, intent.get("times", 1)),
+        "hold_key":          lambda: hold_key(target, intent.get("duration", 2)),
+        "screenshot":        screenshot,
         "show_translations": show_translations,
         "continuous_scroll": lambda: continuous_scroll(target, intent.get("speed", "normal")),
         "continuous_move":   lambda: continuous_move(target, intent.get("speed", "normal")),
@@ -4618,116 +4065,113 @@ def execute(intent):
     fn = action_map.get(action)
     if fn:
         for _ in range(max(1, int(repeat))):
-            fn()
+            try:
+                fn()
+            except Exception as e:
+                print(f"  [!] Action '{action}' failed: {e}")
+                speak("That didn't work")
             if repeat > 1:
                 time.sleep(0.1)
     else:
         print(f"  [!] Unknown action: '{action}'")
         speak("I didn't understand that.")
 
-
-# ---- Main -------------------------------------------------------------------
-
-def banner():
-    os.system("cls" if os.name == "nt" else "clear")
-    print("""
+# =============================================================
+#  Banner & Main
+# =============================================================
+BANNER = r"""
   ================================================
-       ROLEX - Voice Screen Agent
+       ROLEX - Voice Screen Agent  (v3.1 fixed)
   ================================================
 
    WAKE:     Say "Rolex" (while sleeping, wakes it up)
              "Rolex [command]" (wakes + runs command)
 
-   SLEEP:    "Rolex sleep" / "Sleep rolex"
-             "Rolex go to sleep" / "Rolex good night"
-             "Rolex stop listening" / "Rolex pause"
+   SLEEP:    "Rolex sleep" / "Sleep rolex" / "Rolex goodnight"
+   EXIT:     "Rolex exit" / "Exit rolex" / "Rolex goodbye"
              (MUST say Rolex - prevents accidents!)
 
-   EXIT:     "Rolex exit" / "Exit rolex"
-             "Rolex quit" / "Rolex close yourself"
-             "Rolex shutdown" / "Rolex goodbye"
-             "Rolex turn off"
-             (MUST say Rolex - closes program)
+   APPS:     "Open Chrome / VLC / Explorer / YouTube"
+   MOVE:     "Go right" / "Go up a little" / "Move left 300"
+             "Move the mouse to the right" / "Slide cursor left"
+             "Go to the right" / "Drag pointer down"
+   CLICK:    "Click here" / "Double click" / "Right click"
+             "Click on [word]" / "Click the 2nd [word]"
+   SCROLL:   "Scroll up/down" "Scroll down a lot" "Scroll to top"
+   MEDIA:    "Play" "Pause" "Volume up/down" "Mute" "Fullscreen"
+   TABS:     "Go to tab 2" "Next tab" "Close tab" "Go to gmail tab"
+   WINDOWS:  "Minimize / Maximize / Restore" (current or by name)
+   TYPE:     "Type [text]"  "Search for [query]"
+   KEYS:     "Press Ctrl C" "Press Alt F4" "Press Enter 5 times"
+   MULTI:    "Open jersey in movies in file explorer"
+             "Search for cats on youtube"
+   STOP:     "Stop" / "That's enough" (during continuous actions)
 
-   APPS:     "Open Chrome/VLC/Explorer/YouTube"
-             "Open 2nd Chrome account"
-   WINDOWS:  "Minimize" / "Maximize" / "Restore" (current)
-             "Minimize chrome" / "Maximize vlc"
-             "Minimize all chrome" / "Maximize all"
-             "Close all chrome windows"
-             "Close all minimized"
-             "Restore all" / "Show desktop"
-             "Switch to chrome" / "List windows"
-   CLICK:    "Click" / "Click here" -> clicks at mouse position
-             "Double click" / "Right click" -> at mouse position
-             "Click on [word]" -> finds and clicks word
-   TABS:     "Go to tab 2" / "Next tab" / "Previous tab"
-             "Go to gmail tab" / "Close 3rd tab"
-   IMAGES:   "Click on elephant image"
-   MEDIA:    "Play" "Pause" "Volume up/down"
-             "Forward" "Backward" "Fullscreen"
-   FULLSCREEN: "Fullscreen" (auto-detects YouTube/VLC -> F key)
-   SCROLL:   "Scroll up/down" "Scroll down a lot"
-             (MUST include up or down)
-   MOUSE:    "Go right" / "Go up" / "Move down" / "Go to the right"
-             "Move right half" -> moves half the distance
-             "Go up a little" / "Go down a lot" / "Move left 300"
-   SELECT:   "Select [word]"
-   GRID:     "Click 2nd video in 3rd row"
-   BROWSE:   "Go back" "New tab" "Close tab"
-   TYPE:     "Type [text]"
-   SEARCH:   "Search for [query]" / "Search for [query] on YouTube"
-   KEYS:     "Press C" / "Press F5" / "Press Enter"
-             "Press Ctrl C" / "Press Win X" / "Press Alt F4"
-             "Press Ctrl Shift S" (multiple modifiers)
-             "Press Enter 5 times" (repeat)
-             "Hold Shift for 3 seconds"
-             "Copy" "Paste" "Undo" "Save" (shortcuts)
-   CONTINUOUS: "Scroll down until stop" / "Keep scrolling up"
-               "Move right until stop" / "Keep moving down"
-               "Scroll down slowly/fast continuously"
-   MULTI-STEP: (Complex commands automatically broken into steps)
-               "Open jersey in movies in file explorer"
-               "Search for cats on youtube in chrome"
-               "Open resume in documents folder"  
-               "Minimize chrome and open vlc and play"
-               "Go to downloads then open first file"
-               "Open chrome and search for weather"
-               (Say "stop" or "cancel" during execution to halt)
-               (Say "skip" to skip a confusing step)
-   STOP:       "Stop" / "Enough" / "That's good"
-               (works during any continuous action)
+   Run  'python rolex_agent.py --selftest'  to see how
+   the parser handles your phrasing (no mic needed).
   ================================================
-    """)
+"""
 
 
-def test_wake_strip():
-    """Debug: test wake word stripping."""
-    test_cases = [
-        "rolex pause",
-        "rolex play",
-        "rolex forward",
-        "rolex volume up",
-        "rolex open chrome",
-        "rolex click login",
-        "rolex scroll down",
-        "rolex press ctrl c",
-        "rolex go right",
-        "rolex minimize this",
-        "hey rolex open vlc",
-        "rolex please open youtube",
-        "pause rolex",  # trailing
-    ]
-    
-    print("\n  === Wake Strip Tests ===")
-    for test in test_cases:
-        has = has_wake(test)
-        stripped = strip_wake(test)
-        print(f"  Input:    '{test}'")
-        print(f"  Has wake: {has}")
-        print(f"  Stripped: '{stripped}'")
-        print(f"  Intent:   {parse_command(stripped) if stripped else 'none'}")
-        print()
+def banner():
+    os.system("cls" if os.name == "nt" else "clear")
+    print(BANNER)
+
+
+_SELFTEST_CASES = [
+    "move right", "move left", "go up", "go down",
+    "move the mouse to the right",
+    "move mouse to the left",
+    "slide cursor to the right",
+    "drag pointer down",
+    "move the cursor up a little",
+    "move right 300",
+    "move left by 150",
+    "go to the right",
+    "go to the bottom",
+    "go down a lot",
+    "go up half",
+    "can you open chrome please",
+    "please scroll down",
+    "could you move right for me",
+    "volume up", "turn up the volume", "turn it up",
+    "make it louder", "increase the volume", "mute",
+    "scroll down", "scroll up a little", "scroll to the bottom",
+    "scroll", "play", "pause the video", "click on save",
+    "click the third button", "press ctrl c", "press alt f4",
+    "press enter 5 times", "type hello world",
+    "search for cats on youtube", "minimize chrome",
+    "close chrome", "shut down chrome", "turn off vlc",
+    "go to tab 2", "open youtube", "go to github.com",
+    "open google.com", "close notepad", "close spotify",
+    "what time is it", "how are you",
+    "go to sleep", "exit", "minimize this", "maximize this",
+    "take a screenshot", "new tab", "next tab",
+]
+
+
+def run_selftest():
+    print(BANNER)
+    print("  === Parser self-test (local rules only, LLM disabled) ===\n")
+    passed = unknown = 0
+    for phrase in _SELFTEST_CASES:
+        try:
+            # force local-only so the test never touches the network/LLM
+            intent = parse_command(phrase, use_fallback=False)
+        except Exception as e:
+            intent = {"action": "ERROR", "target": str(e)}
+        action = intent.get("action", "?")
+        if action == "unknown":
+            unknown += 1
+            mark = "?? "
+        else:
+            passed += 1
+            mark = "ok "
+        print(f"  {mark} {phrase:42s} -> {action}  {intent.get('target', '')}"
+              f"{'  x' + str(intent.get('repeat', 1)) if intent.get('repeat', 1) > 1 else ''}")
+    print(f"\n  Local rules handled: {passed}/{len(_SELFTEST_CASES)}"
+          f"   (unknown: {unknown})")
+    print("  Anything marked ?? would be the only ones that fall back to the LLM.\n")
 
 
 def main():
@@ -4741,39 +4185,34 @@ def main():
     except Exception:
         pass
 
-    if ollama_ok():
-        print("  [OK] Ollama running - smart mode ON")
+    if ENABLE_LLM and ollama_ok():
+        print("  [OK] Ollama running - smart fallback ON (rarely needed)")
     else:
-        print("  [!] Ollama offline - basic commands work fine")
-    
-    try:
-        if _REDIS_AVAILABLE:
-            print("  [OK] Redis caching enabled")
-    except Exception:
-        pass
+        print("  [!] Ollama offline/disabled - all local commands still work")
+
+    if _REDIS_AVAILABLE:
+        print("  [OK] Redis caching enabled")
     print()
 
     speak("Rolex ready. Say Rolex to wake me up.")
 
     active = False
     last_command_time = time.time()
-    
+
     while True:
         try:
             # ================== SLEEP MODE ==================
             if not active:
                 print("\n  [SLEEP] Waiting for wake word 'Rolex'...")
                 text = listen(timeout=10)
-                
+
                 if not text:
                     continue
-                
-                # In SLEEP mode, EVERYTHING requires "rolex" in it
+
                 if not has_wake(text):
                     print(f"  [Ignored - need wake word] \"{text}\"")
                     continue
-                
-                # ---- Priority 1: Rolex exit ----
+
                 if is_exit(text):
                     speak("Goodbye")
                     try:
@@ -4781,22 +4220,17 @@ def main():
                     except Exception:
                         pass
                     return
-                
-                # ---- Priority 2: Rolex sleep (already asleep) ----
+
                 if is_sleep_command(text):
                     print("  [Info] Already sleeping")
                     continue
-                
-                # ---- Strip wake word to get command ----
+
                 cmd = strip_wake(text)
-                active = True  # ← Activate FIRST before executing
-                last_command_time = time.time()  # ← RESET on wake
-                
+                active = True
+                last_command_time = time.time()
+
                 if cmd and len(cmd.strip()) >= 1:
-                    # Wake word + command: WAKE UP and execute command
                     print(f"  [Wake+Command] \"{cmd}\"")
-                    print("  [WAKE] Now active - executing command")
-                    
                     try:
                         intent = parse_command(cmd)
                         if intent.get("action") != "unknown":
@@ -4805,24 +4239,21 @@ def main():
                     except Exception as e:
                         print(f"  [!] Error executing wake command: {e}")
                         speak("Error running that")
-                    
                     print("  [ACTIVE] Ready for more commands")
                 else:
-                    # Just "Rolex" alone -> activate
                     speak("Yes?")
                     print("  [WAKE] Now active")
 
             # ================== ACTIVE MODE ==================
             else:
                 if _continuous_action.get("running"):
-                    time.sleep(0.2)      # stop-listener is using the mic
+                    time.sleep(0.2)
                     continue
                 print("\n  [ACTIVE] Listening for command...")
                 text = listen(timeout=15)
-                
+
                 if not text:
-                    # Even with no speech, check timeout if active
-                    if active and (time.time() - last_command_time > get_auto_sleep_timeout()):
+                    if time.time() - last_command_time > get_auto_sleep_timeout():
                         active = False
                         speak("Going to sleep due to inactivity.")
                         print("  [SLEEP] Auto-sleep due to inactivity")
@@ -4830,15 +4261,14 @@ def main():
                         remaining = int(get_auto_sleep_timeout() - (time.time() - last_command_time))
                         print(f"  [...] Silence. Still active. (Auto-sleep in {max(0, remaining)}s)")
                     continue
-                
-                # ★ AUTO-SLEEP CHECK ON SPEECH ARRIVAL ★
+
                 if time.time() - last_command_time > get_auto_sleep_timeout():
                     active = False
                     speak("Going to sleep.")
                     print("  [SLEEP] Inactivity timeout expired")
                     continue
 
-                # ---- PRIORITY 1: Stop continuous action (no wake word needed) ----
+                # PRIORITY 1: stop continuous action (no wake word needed)
                 try:
                     if _continuous_action.get("running") and is_stop_command(text):
                         stop_continuous_action()
@@ -4847,8 +4277,8 @@ def main():
                         continue
                 except Exception:
                     pass
-                
-                # ---- PRIORITY 2: EXIT (REQUIRES "rolex" word) ----
+
+                # PRIORITY 2: EXIT (requires "rolex")
                 if is_exit(text):
                     speak("Goodbye")
                     try:
@@ -4860,8 +4290,8 @@ def main():
                     except Exception:
                         pass
                     return
-                
-                # ---- PRIORITY 3: SLEEP (REQUIRES "rolex" word) ----
+
+                # PRIORITY 3: SLEEP (requires "rolex")
                 if is_sleep_command(text):
                     try:
                         stop_continuous_action()
@@ -4871,22 +4301,20 @@ def main():
                     active = False
                     print("  [SLEEP] Going to sleep")
                     continue
-                
-                # ---- PRIORITY 4: Strip wake word if user re-said it ----
+
+                # PRIORITY 4: strip wake word if re-said
                 if has_wake(text):
                     text = strip_wake(text)
                     if not text or len(text) < 2:
                         speak("Yes?")
                         last_command_time = time.time()
                         continue
-                
-                # ---- Execute the command (no wake word needed in active mode) ----
+
                 intent = parse_command(text)
-                
-                # Reset timer only for useful (non-unknown) commands
+
                 if intent.get("action") != "unknown":
                     last_command_time = time.time()
-                
+
                 execute(intent)
 
         except KeyboardInterrupt:
@@ -4901,7 +4329,7 @@ def main():
             except Exception:
                 pass
             return
-        
+
         except Exception as e:
             print(f"  [ERROR] {e}")
             import traceback
@@ -4910,4 +4338,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        run_selftest()
+    else:
+        main()

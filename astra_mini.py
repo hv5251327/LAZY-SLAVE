@@ -963,7 +963,7 @@ NOISE_FLOOR = 300
 SILENCE_MULT = 1.4        # was 1.6 - wakes on quieter speech
 MAX_RECORD_SECONDS = 10
 SILENCE_SHORT = 0.35   # quick commands end fast
-SILENCE_LONG  = 0.8    # longer commands
+SILENCE_LONG  = 0.6    # longer commands
 
 
 def _to_mono(data):
@@ -1107,9 +1107,12 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
     frames = []
     silence_count = 0
     speech_count = 0
-    has_speech = False
     block_dur = 0.08
     block_size = int(MIC_SAMPLE_RATE * block_dur)
+
+    started = False
+    preroll = []   # ~0.3s of audio before speech onset, keeps word starts
+    PREROLL_BLOCKS = 4
     max_blocks = int(max_seconds / block_dur)
 
     threshold = max(NOISE_FLOOR * SILENCE_MULT, 220)
@@ -1123,12 +1126,21 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
         for _ in range(max_blocks):
             data, _ = stream.read(block_size)
             mono_i16 = _to_mono(data)          # always int16
-            frames.append(mono_i16.copy())
             mono = mono_i16.astype(np.float32)
             rms = float(np.sqrt(np.mean(mono ** 2)))
 
+            if not started:
+                preroll.append(mono_i16.copy())
+                if len(preroll) > PREROLL_BLOCKS:
+                    preroll.pop(0)
+                if rms > threshold:
+                    started = True
+                    frames.extend(preroll)
+                    speech_count += 1
+                continue
+
+            frames.append(mono_i16.copy())
             if rms > threshold:
-                has_speech = True
                 speech_count += 1
                 silence_count = 0
             else:
@@ -1140,12 +1152,13 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
             else:
                 silence_needed = int(SILENCE_LONG / block_dur)
 
-            if has_speech and silence_count >= silence_needed:
+            if silence_count >= silence_needed:
                 break
 
         stream.stop()
         stream.close()
-        return np.concatenate(frames) if has_speech else None
+        # Google only needs the speech itself - less audio = faster response
+        return np.concatenate(frames) if started else None
     except Exception as e:
         print(f"  [!] Recording error: {e}")
         return None
@@ -1209,7 +1222,11 @@ def transcribe(audio):
 def listen(prompt=None, timeout=MAX_RECORD_SECONDS):
     if prompt:
         speak(prompt)
+    t_tts = time.time()
     wait_for_tts()          # don't record over our own voice
+    tts_waited = time.time() - t_tts
+    if tts_waited > 0.05:
+        print(f"  [*] Waited {tts_waited:.1f}s for voice to finish before listening")
     drain_mic()
     print("  [*] Listening...")
     t0 = time.time()
@@ -2268,8 +2285,9 @@ _SHORTCUTS = [("select all", "ctrl a"), ("copy", "ctrl c"), ("paste", "ctrl v"),
 
 def apply_shortcuts(t):
     for word, combo in _SHORTCUTS:
-        t = re.sub(rf"^\s*(?:press\s+|do\s+)?{re.escape(word)}"
-                   rf"(?:\s+(?:now|please|it))?\s*$", f" press {combo} ", t)
+        t = re.sub(rf"^\s*(?:press\s+|do\s+|hit\s+)?{re.escape(word)}"
+                   rf"(?:\s+(?:now|please|it|this|the page|page|the window|window))?\s*$",
+                   f" press {combo} ", t)
     return t
 
 
@@ -2527,6 +2545,122 @@ def normalize_command(text):
     t = t.replace(" see you later ", " goodbye ")
     t = t.replace(" bye bye ", " goodbye ")
     t = t.replace(" catch you later ", " goodbye ")
+
+    # ---- Natural aliases v2: more ways to say the same command ----
+    # British spellings
+    t = t.replace(" maximise ", " maximize ")
+    t = t.replace(" minimise ", " minimize ")
+    t = t.replace(" unminimize ", " restore ")
+    t = t.replace(" unmaximize ", " restore ")
+
+    # Window variants
+    t = t.replace(" send to taskbar ", " minimize this ")
+    t = t.replace(" tuck away ", " minimize this ")
+    t = t.replace(" tuck ", " minimize ")
+    t = t.replace(" iconify ", " minimize this ")
+    t = t.replace(" make it fullscreen ", " fullscreen ")
+    t = t.replace(" make this fullscreen ", " fullscreen ")
+    t = t.replace(" go fullscreen ", " fullscreen ")
+    t = t.replace(" enter fullscreen ", " fullscreen ")
+    t = t.replace(" get out of fullscreen ", " fullscreen ")
+
+    # Open variants
+    t = t.replace(" turn on ", " open ")
+    t = t.replace(" switch on ", " open ")
+    t = t.replace(" kick off ", " open ")
+    t = t.replace(" spin up ", " open ")
+    t = t.replace(" get me ", " open ")
+    t = t.replace(" bring me ", " open ")
+    t = t.replace(" show me ", " open ")
+    t = t.replace(" pop up ", " open ")
+    t = t.replace(" call up ", " open ")
+
+    # Close variants
+    t = t.replace(" kill ", " close ")
+    t = t.replace(" quit ", " close ")
+    t = t.replace(" close out of ", " close ")
+    t = t.replace(" close out ", " close ")
+    t = t.replace(" get rid of ", " close ")
+    t = t.replace(" trash ", " close ")
+    t = t.replace(" dump ", " close ")
+
+    # Volume variants
+    t = t.replace(" turn the music up ", " volume up ")
+    t = t.replace(" turn the sound up ", " volume up ")
+    t = t.replace(" turn the audio up ", " volume up ")
+    t = t.replace(" turn the music down ", " volume down ")
+    t = t.replace(" turn the sound down ", " volume down ")
+    t = t.replace(" turn the audio down ", " volume down ")
+    t = t.replace(" crank up the volume ", " volume up ")
+    t = t.replace(" crank the volume up ", " volume up ")
+    t = t.replace(" put the volume up ", " volume up ")
+    t = t.replace(" bring up the volume ", " volume up ")
+    t = t.replace(" reduce the volume ", " volume down ")
+    t = t.replace(" bring down the volume ", " volume down ")
+    t = t.replace(" bring the volume down ", " volume down ")
+    t = t.replace(" lower the music ", " volume down ")
+    t = t.replace(" lower the sound ", " volume down ")
+    t = t.replace(" lower the audio ", " volume down ")
+    t = t.replace(" soften the sound ", " volume down ")
+    t = t.replace(" quieten ", " volume down ")
+    t = t.replace(" boost the volume ", " volume up ")
+
+    # Media variants ("stop the X" = pause, not Rolex-sleep)
+    t = t.replace(" stop the music ", " pause ")
+    t = t.replace(" stop the video ", " pause ")
+    t = t.replace(" stop the song ", " pause ")
+    t = t.replace(" stop the movie ", " pause ")
+    t = t.replace(" stop the playback ", " pause ")
+    t = t.replace(" stop the audio ", " pause ")
+    t = t.replace(" stop the media ", " pause ")
+    t = t.replace(" stop playing ", " pause ")
+    t = t.replace(" stop the track ", " pause ")
+    t = t.replace(" put it back on ", " play ")
+    t = t.replace(" play the video ", " play ")
+    t = t.replace(" play the music ", " play ")
+    t = t.replace(" play the song ", " play ")
+    t = t.replace(" play the movie ", " play ")
+    t = t.replace(" play the audio ", " play ")
+    t = t.replace(" play the track ", " play ")
+    t = t.replace(" resume playback ", " play ")
+    t = t.replace(" resume the video ", " play ")
+    t = t.replace(" resume the music ", " play ")
+
+    # Scroll variants
+    t = t.replace(" further down ", " scroll down ")
+    t = t.replace(" further up ", " scroll up ")
+    t = t.replace(" go lower ", " scroll down ")
+    t = t.replace(" go higher ", " scroll up ")
+    t = t.replace(" page downward ", " page down ")
+    t = t.replace(" page upward ", " page up ")
+
+    # Screenshot variants
+    t = t.replace(" screen shot ", " screenshot ")
+    t = t.replace(" screen capture ", " screenshot ")
+    t = t.replace(" take a snap ", " screenshot ")
+    t = t.replace(" take a screenshot of ", " screenshot ")
+
+    # Typing variants
+    t = t.replace(" type out ", " type ")
+    t = t.replace(" write out ", " type ")
+    t = t.replace(" key in ", " type ")
+
+    # Search variants
+    t = t.replace(" ask google for ", " google ")
+    t = t.replace(" let me google ", " google ")
+    t = t.replace(" look up ", " search for ")     # also handled earlier; belt+braces
+
+    # Window listing variants
+    t = t.replace(" show my windows ", " list windows ")
+    t = t.replace(" what do i have open ", " list windows ")
+    t = t.replace(" which windows are open ", " list windows ")
+
+    # Mouse move extra aliases (multi-word forms)
+    t = t.replace(" move the mouse over to ", " move ")
+    t = t.replace(" move the cursor over to ", " move ")
+    t = t.replace(" slide the mouse over to ", " move ")
+    t = t.replace(" nudge the mouse ", " move ")
+    t = t.replace(" nudge the cursor ", " move ")
 
     # ---- Multi-step connectors ----
     for conn in (" and after that ", " after that ", " afterwards ",
@@ -3247,6 +3381,7 @@ def _parse_command_impl(t, text=None, use_fallback=True):
         m = re.match(pat, t)
         if m:
             app = m.group(1).strip().rstrip(".")
+            app = re.sub(r"^(?:the|a|an)\s+", "", app)   # "open the vlc" -> "vlc"
             if any(kw in app for kw in [" in ", " for ", " about ", " on ", " of ", " with "]):
                 break
             if re.match(r"tab\s+\w+", app) or re.match(r"(?:the\s+)?\w+\s+tab$", app):
@@ -3282,6 +3417,36 @@ def _parse_command_impl(t, text=None, use_fallback=True):
     # ---- Play / Pause ----
     if re.search(r"\b(play|pause|resume|stop playing)\b", t):
         return {"action": "play_pause", "target": ""}
+
+    # ---- Media track control (next/previous song) ----
+    if re.search(r"\b(next|skip|change|another|forward)\s+(?:one\s+)?(?:track|song)\b", t):
+        return {"action": "media_next", "target": ""}
+    if re.search(r"\b(previous|prev|last|back|another)\s+(?:track|song)\b", t):
+        return {"action": "media_prev", "target": ""}
+    if t.strip() in ("next song", "next track", "skip track", "skip song",
+                     "change song", "change track", "skip", "next", "forward"):
+        return {"action": "media_next", "target": ""}
+    if t.strip() in ("previous song", "previous track", "prev song",
+                     "last song", "last track", "back song"):
+        return {"action": "media_prev", "target": ""}
+
+    # ---- Bare navigation words ----
+    if t.strip() in ("back", "previous", "go back please"):
+        return {"action": "go_back", "target": ""}
+    if t.strip() in ("go forward", "go ahead"):
+        return {"action": "forward", "target": "10"}
+    if t.strip() == "rewind":
+        return {"action": "backward", "target": "10"}
+
+    # ---- Volume max / min ----
+    if re.search(r"\bvolume\s+(max|maximum|full|loudest|highest)\b", t):
+        return {"action": "volume_up", "target": "15"}
+    if re.search(r"\b(max|maximum|full|loudest)\s+volume\b", t):
+        return {"action": "volume_up", "target": "15"}
+    if re.search(r"\bvolume\s+(min|minimum|zero|lowest|off)\b", t):
+        return {"action": "volume_down", "target": "15"}
+    if re.search(r"\b(min|minimum|lowest|zero)\s+volume\b", t):
+        return {"action": "volume_down", "target": "15"}
 
     # ---- Volume ----
     if re.search(r"(volume up|increase volume|louder|raise (?:the )?volume)", t):
@@ -3617,11 +3782,11 @@ def open_app(name):
 
     speak(f"Searching for {name}")
     pyautogui.press("win")
-    time.sleep(1.0)
-    pyautogui.typewrite(name, interval=0.03)
-    time.sleep(1.5)
+    time.sleep(0.8)
+    pyautogui.typewrite(name, interval=0.02)
+    time.sleep(1.1)
     pyautogui.press("enter")
-    time.sleep(0.5)
+    time.sleep(0.3)
     speak("Done.")
 
 
@@ -4294,6 +4459,18 @@ _SELFTEST_CASES = [
     "close chrome", "shut down chrome", "turn off vlc",
     "go to tab 2", "open youtube", "go to github.com",
     "open google.com", "close notepad", "close spotify",
+    "turn on chrome", "switch on vlc", "open the vlc",
+    "stop the music", "stop the video", "resume the song",
+    "next song", "previous track", "skip track", "change song",
+    "go forward", "rewind",
+    "volume max", "max volume", "volume min",
+    "turn the music up", "crank up the volume", "lower the music",
+    "turn the sound down", "reduce the volume",
+    "maximise this", "minimise chrome", "restore this",
+    "close out of chrome", "kill vlc", "quit spotify", "get rid of chrome",
+    "refresh the page", "save the page", "take a snap", "screen shot",
+    "further down", "further up", "go lower", "go higher",
+    "show my windows", "nudge the cursor right", "key in hello",
     "what time is it", "how are you",
     "go to sleep", "exit", "minimize this", "maximize this",
     "take a screenshot", "new tab", "next tab",

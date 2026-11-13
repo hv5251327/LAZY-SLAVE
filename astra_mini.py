@@ -66,6 +66,11 @@ import time
 # immediately instead of sitting blank while numpy/pyautogui load.
 print("ROLEX - starting...", flush=True)
 _T_START = time.time()
+try:
+    sys.stdout.reconfigure(line_buffering=True)   # never let prints sit in a buffer
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 import json
 import subprocess
@@ -967,13 +972,17 @@ SILENCE_LONG  = 0.6    # longer commands
 
 
 def _to_mono(data):
-    """Average all channels to mono.
+    """Pick the LOUDEST sample per frame across channels.
 
-    Laptop mic arrays often have a dead ch0.  ALWAYS returns int16 -
-    the WAV writer declares 2 bytes/sample, so anything else corrupts it.
+    Laptop mic arrays often have a dead/quiet channel - averaging them
+    throws away half the signal (you end up shouting at the machine).
+    ALWAYS returns int16 - the WAV writer declares 2 bytes/sample,
+    so anything else corrupts it.
     """
     if data.ndim > 1:
-        return data.mean(axis=1).astype(np.int16)
+        af = data.astype(np.float32)
+        idx = np.argmax(np.abs(af), axis=1)
+        return af[np.arange(len(af)), idx].astype(np.int16)
     return data.flatten().astype(np.int16)
 
 
@@ -987,8 +996,9 @@ def calibrate_noise_floor(seconds=0.45):
         sd.wait()
         mono = _to_mono(data).astype(np.float32)
         rms = float(np.sqrt(np.mean(mono ** 2)))
-        NOISE_FLOOR = min(1500, max(80, int(rms * 1.15)))
-        print(f"  [*] Noise floor: {NOISE_FLOOR}")
+        # Cap the ceiling at 600: a busy room must not force you to shout.
+        NOISE_FLOOR = min(600, max(60, int(rms * 1.15)))
+        print(f"  [*] Noise floor: {NOISE_FLOOR}  (needs speech louder than ~{int(max(NOISE_FLOOR * SILENCE_MULT, 200))} RMS to start)")
     except Exception as e:
         print(f"  [!] Calibration failed, using default: {e}")
 
@@ -1103,19 +1113,42 @@ print("  [*] TTS engine ready (thread-safe)")
 # =============================================================
 #  Audio Recording & STT
 # =============================================================
+def normalize_gain(audio):
+    """Boost quiet speech so Google STT hears it.
+
+    Quiet mics (and people who sit further from the laptop) produce int16
+    peaks of a few thousand - Google STT just gives up.  Boost toward a
+    healthy peak, with a hard cap so noise is never amplified to hell.
+    """
+    a = np.asarray(audio, dtype=np.float32)
+    if len(a) == 0:
+        return audio
+    peak = float(np.abs(a).max())
+    if peak < 120:                    # silence - nothing to gain
+        return audio
+    TARGET = 16000.0                  # ~50% of int16 full scale
+    max_gain = 14.0
+    gain = min(TARGET / max(peak, 1.0), max_gain)
+    if gain <= 1.15:
+        return audio
+    boosted = np.clip(a * gain, -32768, 32767).astype(np.int16)
+    print(f"  [*] Mic gain boost x{gain:.1f} (peak {int(peak)} -> {int(np.abs(boosted.astype(np.float32)).max())})")
+    return boosted
+
+
 def record_audio(max_seconds=MAX_RECORD_SECONDS):
     frames = []
     silence_count = 0
     speech_count = 0
-    block_dur = 0.08
+    block_dur = 0.05
     block_size = int(MIC_SAMPLE_RATE * block_dur)
 
     started = False
-    preroll = []   # ~0.3s of audio before speech onset, keeps word starts
-    PREROLL_BLOCKS = 4
+    preroll = []   # ~0.35s of audio before speech onset, keeps word starts
+    PREROLL_BLOCKS = 7
     max_blocks = int(max_seconds / block_dur)
 
-    threshold = max(NOISE_FLOOR * SILENCE_MULT, 220)
+    threshold = max(NOISE_FLOOR * SILENCE_MULT, 180)
 
     try:
         stream = sd.InputStream(
@@ -1198,6 +1231,7 @@ def transcribe(audio):
         return None
     if audio is None or len(audio) < 1600:
         return None
+    audio = normalize_gain(audio)     # quiet speech -> Google STT hears it
     wav = audio_to_wav_bytes(audio)
     rec = _sr_module.Recognizer()
     rec.pause_threshold = 0.6
@@ -1244,8 +1278,15 @@ def listen(prompt=None, timeout=MAX_RECORD_SECONDS):
     if text:
         print(f"  [Heard] \"{text}\"  ({time.time()-t0:.1f}s total)")
     else:
-        print(f"  [..] STT returned nothing (internet needed for Google STT). "
-              f"Recorded {len(audio)/MIC_SAMPLE_RATE:.1f}s @ peak={peak}")
+        print(f"  [..] STT returned nothing (Google STT, language={STT_LANGUAGE}, needs internet). "
+              f"Recorded {len(audio)/MIC_SAMPLE_RATE:.1f}s @ peak={peak} rms={rms}")
+        if peak < 800:
+            print("  [!] Peak is low even after best-channel selection - raise the Windows mic "
+                  "volume/boost, move closer, or close the laptop lid half-way (onboard mic array).")
+        else:
+            print("  [!] Voice was loud enough, so Google likely refused it: check internet. "
+                  "If your English accent is not Indian English, change STT_LANGUAGE "
+                  "(currently en-IN) to en-US or en-GB near get_auto_sleep_timeout().")
     return text
 
 
@@ -3242,7 +3283,7 @@ def _parse_command_impl(t, text=None, use_fallback=True):
             "google": "https://www.google.com", "github": "https://github.com",
             "maps": "https://maps.google.com", "facebook": "https://www.facebook.com",
             "twitter": "https://twitter.com", "x": "https://x.com",
-            "instagram": "https://www.instagram.com", "reddit": "https://reddit.com",
+            "instagram": "https://www.instagram.com", "reddit": "https://www.reddit.com",
             "wikipedia": "https://www.wikipedia.org",
         }
         if target in site_domains:

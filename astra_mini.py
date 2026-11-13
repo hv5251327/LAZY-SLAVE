@@ -2013,11 +2013,123 @@ def ocr_screen(force=False, screenshot=None):
     return words
 
 
-def find_on_screen(target, occurrence=1, prefer_region=None, force_ocr=False):
+# =============================================================
+#  Exact multi-word ("phrase") on-screen matching
+#  A two-word target must be found as ONE phrase sitting on a line,
+#  never as scattered single-word hits.
+# =============================================================
+def _norm_ocr_text(text):
+    t = re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
+    return " ".join(t.split())
+
+
+def _cluster_ocr_lines(words):
+    if not words:
+        return []
+    ws = sorted(words, key=lambda w: (w["y"], w["x"]))
+    lines = []
+    cur = [ws[0]]
+    for w in ws[1:]:
+        heights = [c.get("h", 14) for c in cur]
+        mean_h = sum(heights) / len(heights)
+        tol = max(14, int(mean_h * 0.9))
+        cy = sum(c["y"] for c in cur) / len(cur)
+        if abs(w["y"] - cy) <= tol:
+            cur.append(w)
+        else:
+            lines.append(sorted(cur, key=lambda c: c["x"]))
+            cur = [w]
+    lines.append(sorted(cur, key=lambda c: c["x"]))
+    return lines
+
+
+def find_phrase_on_screen(target, occurrence=1, prefer_region=None, force_ocr=False):
     words = ocr_screen(force=force_ocr)
     if not words:
         return None
+    ptxt = _norm_ocr_text(target)
+    if not ptxt:
+        return None
+    screen_h = pyautogui.size()[1]
+
+    matches = []
+    for line in _cluster_ocr_lines(words):
+        line_text = ""
+        spans = []   # (start, end, word)
+        for w in line:
+            nt = _norm_ocr_text(w["text"])
+            if not nt:
+                continue
+            if line_text:
+                line_text += " "
+            start = len(line_text)
+            line_text += nt
+            spans.append((start, len(line_text), w))
+        if not line_text:
+            continue
+        for m in re.finditer(re.escape(ptxt), line_text):
+            if m.start() > 0 and line_text[m.start() - 1] not in (" ", ".", ",", "-", "/", "(", "\"", "'"):
+                continue                      # inside a longer token - not this phrase
+            end_ch = m.end()
+            if end_ch < len(line_text) and line_text[end_ch] not in (" ", ".", ",", "-", "/", ")", "\"", "'"):
+                continue
+            hit = [w for (s, e, w) in spans if e > m.start() and s < end_ch]
+            if not hit:
+                continue
+            left = min(w["x"] - w.get("w", 40) / 2 for w in hit)
+            right = max(w["x"] + w.get("w", 40) / 2 for w in hit)
+            ys = [w["y"] for w in hit]
+            matches.append({"x": int((left + right) / 2),
+                            "y": int(sum(ys) / len(ys)),
+                            "text": ptxt})
+    if not matches:
+        # conservative fuzzy: a whole line that is almost exactly the phrase
+        for line in _cluster_ocr_lines(words):
+            line_text = " ".join(_norm_ocr_text(w["text"]) for w in line).strip()
+            line_text = re.sub(r"\s+", " ", line_text).strip()
+            if not line_text:
+                continue
+            if SequenceMatcher(None, ptxt, line_text).ratio() >= 0.85:
+                left = min(w["x"] - w.get("w", 40) / 2 for w in line)
+                right = max(w["x"] + w.get("w", 40) / 2 for w in line)
+                ys = [w["y"] for w in line]
+                matches.append({"x": int((left + right) / 2),
+                                "y": int(sum(ys) / len(ys)),
+                                "text": line_text})
+                break
+    if not matches:
+        return None
+
+    matches.sort(key=lambda m: (m["y"] // 20, m["x"]))
+    if prefer_region and len(matches) > 1:
+        def _bonus(m):
+            if prefer_region == "top" and m["y"] < screen_h * 0.33:
+                return -0.1
+            if prefer_region == "bottom" and m["y"] > screen_h * 0.66:
+                return -0.1
+            return 0.0
+        matches.sort(key=lambda m: m["y"] + (_bonus(m) * screen_h))
+    occurrence = min(max(1, occurrence), len(matches))
+    m = matches[occurrence - 1]
+    print(f"  [OK] phrase #{occurrence}: \"{m['text']}\" at ({m['x']},{m['y']})")
+    return (m["x"], m["y"])
+
+
+def find_on_screen(target, occurrence=1, prefer_region=None, force_ocr=False):
     target_low = target.lower().strip()
+    # Multi-word target: MUST be one phrase on one line - never a lone word.
+    if " " in target_low:
+        phrase = find_phrase_on_screen(target_low, occurrence=occurrence,
+                                       prefer_region=prefer_region,
+                                       force_ocr=force_ocr)
+        if phrase:
+            return phrase
+        print(f"  [!] Phrase \"{target_low}\" not found as exact words on one line")
+        return None
+
+    words = ocr_screen(force=force_ocr)
+    if not words:
+        return None
     screen_h = pyautogui.size()[1]
     matches = []
     for w in words:
@@ -3948,7 +4060,9 @@ def click_word(word, occurrence=1):
         return
     hw_scroll(5)
     time.sleep(0.4)
-    if ollama_ok():
+    # Only single-word targets may fall back to an LLM-extracted keyword -
+    # for a phrase, that would click just one word (exactly what we don't want).
+    if " " not in word.strip() and ollama_ok():
         kw = extract_keyword(f"click {word}")
         if kw and kw != word:
             c2 = find_on_screen(kw, force_ocr=True)

@@ -83,7 +83,6 @@ import base64
 import urllib.parse
 import hashlib
 from difflib import SequenceMatcher
-from functools import lru_cache
 
 
 class _LazyModule:
@@ -132,7 +131,15 @@ def _setup_pyautogui(m):
 np = _LazyModule("numpy")
 pyttsx3 = _LazyModule("pyttsx3")
 pyautogui = _LazyModule("pyautogui", _setup_pyautogui)
-import sounddevice as sd
+try:
+    import sounddevice as sd
+    _SD_OK = True
+except Exception as _sd_err:
+    sd = None
+    _SD_OK = False
+    print(f"  [!] sounddevice/PortAudio unavailable ({_sd_err})")
+    print("  [!] Mic will NOT work. Install: pip install sounddevice "
+          "(needs PortAudio - comes with the Windows wheel)")
 from PIL import Image
 
 print(f"[*] Core imports: {time.time() - _T_START:.1f}s")
@@ -257,12 +264,14 @@ try:
         _user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
         time.sleep(0.08)
         _user32.SendInput(1, ctypes.byref(up),   ctypes.sizeof(INPUT))
+        _invalidate_ocr()
 
     def reliable_click(x, y):
         x, y = int(x), int(y)
         _user32.SetCursorPos(x, y)
         time.sleep(0.04)
         _send_click()
+        _invalidate_ocr()
         print(f"  [Click] ({x}, {y})")
 
     def reliable_double_click(x, y):
@@ -272,6 +281,7 @@ try:
         _send_click()
         time.sleep(0.05)
         _send_click()
+        _invalidate_ocr()
         print(f"  [DblClick] ({x}, {y})")
 
     def right_click_at(x, y):
@@ -283,6 +293,7 @@ try:
         _user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
         time.sleep(0.08)
         _user32.SendInput(1, ctypes.byref(up),   ctypes.sizeof(INPUT))
+        _invalidate_ocr()
 
     def _send_key(vk, key_up=False):
         flags = 0
@@ -309,6 +320,40 @@ try:
         except Exception:
             pyautogui.scroll(int(clicks) * 100)
 
+    def _virtual_bounds():
+        """Full virtual desktop rect (multi-monitor). Falls back to (0,0,100000,100000)."""
+        try:
+            gsm = _user32.GetSystemMetrics
+            x0 = gsm(76)   # SM_XVIRTUALSCREEN
+            y0 = gsm(77)   # SM_YVIRTUALSCREEN
+            w  = gsm(78)   # SM_CXVIRTUALSCREEN
+            h  = gsm(79)   # SM_CYVIRTUALSCREEN
+            if w > 0 and h > 0:
+                return (x0, y0, x0 + w - 1, y0 + h - 1)
+        except Exception:
+            pass
+        return (0, 0, 100000, 100000)
+
+    def _force_foreground(hwnd):
+        """Bring a window to the foreground even when Windows blocks focus steal."""
+        try:
+            fg = _user32.GetForegroundWindow()
+            fg_tid = _user32.GetWindowThreadProcessId(fg, None)
+            cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            attached = False
+            if fg_tid and fg_tid != cur_tid:
+                ctypes.windll.user32.AttachThreadInput(cur_tid, fg_tid, True)
+                attached = True
+            _user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+            _user32.SetForegroundWindow(hwnd)
+            _user32.BringWindowToTop(hwnd)
+            if attached:
+                ctypes.windll.user32.AttachThreadInput(cur_tid, fg_tid, False)
+            return True
+        except Exception as e:
+            print(f"  [!] Could not force foreground: {e}")
+            return False
+
     def _cursor_pos():
         pt = wintypes.POINT()
         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
@@ -323,12 +368,15 @@ except Exception as _e:
 
     def reliable_click(x, y):
         pyautogui.click(x=int(x), y=int(y))
+        _invalidate_ocr()
 
     def reliable_double_click(x, y):
         pyautogui.doubleClick(x=int(x), y=int(y))
+        _invalidate_ocr()
 
     def right_click_at(x, y):
         pyautogui.click(x=int(x), y=int(y), button="right")
+        _invalidate_ocr()
 
     def press_vk(vk, times=1, delay=0.08):
         key_map = {VK_VOLUME_MUTE: "volumemute", VK_VOLUME_DOWN: "volumedown",
@@ -349,6 +397,12 @@ except Exception as _e:
             return _pg.position()
         except Exception:
             return (0, 0)
+
+    def _virtual_bounds():
+        return (0, 0, 100000, 100000)
+
+    def _force_foreground(hwnd):
+        return False
 
 
 # =============================================================
@@ -497,7 +551,7 @@ def restore_window_by_name(name, occurrence=1):
     target = pool[n - 1]
     speak(f"Restoring {name}")
     ShowWindow(target["hwnd"], SW_RESTORE)
-    SetForegroundWindow(target["hwnd"])
+    _force_foreground(target["hwnd"])
 
 
 def maximize_window_by_name(name, occurrence=1):
@@ -525,7 +579,7 @@ def maximize_window_by_name(name, occurrence=1):
     if target["minimized"]:
         ShowWindow(target["hwnd"], SW_RESTORE)
     ShowWindow(target["hwnd"], SW_MAXIMIZE)
-    SetForegroundWindow(target["hwnd"])
+    _force_foreground(target["hwnd"])
 
 
 def close_all_minimized():
@@ -630,7 +684,7 @@ def click_taskbar_icon(name, occurrence=1):
     speak(f"Switching to {name}")
     if target["minimized"]:
         ShowWindow(target["hwnd"], SW_RESTORE)
-    SetForegroundWindow(target["hwnd"])
+    _force_foreground(target["hwnd"])
 
 
 # ---- Detect windows that need double-click (File Explorer, Desktop) ----
@@ -650,6 +704,7 @@ def needs_double_click():
 
 
 def smart_click(x, y):
+    _invalidate_ocr()
     if needs_double_click():
         print("  [Smart] File Explorer / Desktop detected -> double click")
         reliable_double_click(x, y)
@@ -705,7 +760,12 @@ def parse_move_amount(text, default=200):
 
 def _set_cursor(x, y):
     u = ctypes.windll.user32
-    u.SetCursorPos(int(max(2, min(x, 100000))), int(max(2, min(y, 100000))))
+    try:
+        x0, y0, x1, y1 = _virtual_bounds()
+    except Exception:
+        x0, y0, x1, y1 = 0, 0, 100000, 100000
+    u.SetCursorPos(int(max(x0 + 2, min(x, x1 - 2))),
+                   int(max(y0 + 2, min(y, y1 - 2))))
 
 
 def move_mouse(direction, amount=None):
@@ -716,14 +776,27 @@ def move_mouse(direction, amount=None):
     if amount in (None, 0):
         amount = parse_move_amount(direction)
 
-    screen_w, screen_h = pyautogui.size()
+    try:
+        if _WIN32_OK:
+            _vx0, _vy0, _vx1, _vy1 = _virtual_bounds()
+            if _vx1 - _vx0 > 200 and _vy1 - _vy0 > 200:
+                x_min, y_min, x_max, y_max = _vx0 + 2, _vy0 + 2, _vx1 - 2, _vy1 - 2
+            else:
+                x_min, y_min = 1, 1
+                x_max, y_max = pyautogui.size()[0] - 2, pyautogui.size()[1] - 2
+        else:
+            x_min, y_min = 1, 1
+            x_max, y_max = pyautogui.size()[0] - 2, pyautogui.size()[1] - 2
+    except Exception:
+        x_min, y_min = 1, 1
+        x_max, y_max = pyautogui.size()[0] - 2, pyautogui.size()[1] - 2
     x, y = _cursor_pos()
     dx, dy = h * amount, v * amount
     if h and v:
         dx, dy = int(dx * 0.707), int(dy * 0.707)
 
-    nx = max(1, min(screen_w - 2, x + dx))
-    ny = max(1, min(screen_h - 2, y + dy))
+    nx = max(x_min, min(x_max, x + dx))
+    ny = max(y_min, min(y_max, y + dy))
 
     if nx == x and ny == y:
         if v and not h:
@@ -865,10 +938,10 @@ def _redis_init():
         _redis_client = client
         _REDIS_AVAILABLE = True
         print("  [OK] Redis connected - caching enabled")
-    except Exception as _e:
+    except Exception:
         _redis_client = None
         _REDIS_AVAILABLE = False
-        print(f"  [..] Redis not available - using memory cache")
+        print("  [..] Redis not available - using memory cache")
 
 
 def _thumb_hash_from_image(img):
@@ -995,7 +1068,11 @@ def calibrate_noise_floor(seconds=0.45):
                       channels=MIC_CHANNELS, dtype="int16")
         sd.wait()
         mono = _to_mono(data).astype(np.float32)
-        rms = float(np.sqrt(np.mean(mono ** 2)))
+        chunk = int(MIC_SAMPLE_RATE * 0.05)
+        rms_vals = [float(np.sqrt(np.mean(mono[i:i + chunk] ** 2)))
+                    for i in range(0, max(1, len(mono) - chunk), chunk)]
+        # median: if you were talking during calibration, the quiet chunks win
+        rms = float(np.median(rms_vals)) if rms_vals else float(np.sqrt(np.mean(mono ** 2)))
         # Cap the ceiling at 600: a busy room must not force you to shout.
         NOISE_FLOOR = min(600, max(60, int(rms * 1.15)))
         print(f"  [*] Noise floor: {NOISE_FLOOR}  (needs speech louder than ~{int(max(NOISE_FLOOR * SILENCE_MULT, 200))} RMS to start)")
@@ -1028,6 +1105,7 @@ _tts_idle.set()
 
 
 def _speech_worker():
+    global _tts_pending
     try:
         import pythoncom
         pythoncom.CoInitialize()
@@ -1046,7 +1124,8 @@ def _speech_worker():
     except Exception as e:
         print(f"  [!] TTS worker init failed: {e}")
         with _speech_lock:
-            _tts_idle.set()          # never leave callers blocked on wait_for_tts
+            _tts_pending = 0             # avoid counter drift if init died on first speaks
+            _tts_idle.set()              # never leave callers blocked on wait_for_tts
         return
 
     while True:
@@ -1061,7 +1140,6 @@ def _speech_worker():
                 print(f"  [!] TTS error: {e}")
             finally:
                 with _speech_lock:
-                    global _tts_pending
                     _tts_pending -= 1
                     if _tts_pending <= 0:
                         _tts_pending = 0
@@ -1098,11 +1176,12 @@ def speak(text, wait=False):
         wait_for_tts()
 
 
-def wait_for_tts(timeout=10.0):
+def wait_for_tts(timeout=6.0):
     """Block until the engine has FINISHED speaking (not just drained queue)."""
     end = time.time() + timeout
     while not _tts_idle.wait(0.05):
         if time.time() > end:
+            print(f"  [!] Voice wait timed out after {timeout:.0f}s (TTS may be hung) - continuing")
             return False
     return True
 
@@ -1136,7 +1215,10 @@ def normalize_gain(audio):
     return boosted
 
 
-def record_audio(max_seconds=MAX_RECORD_SECONDS):
+_last_tts_wait = {"s": 0.0}
+
+
+def record_audio(max_seconds=MAX_RECORD_SECONDS, skip_while_tts=False):
     frames = []
     silence_count = 0
     speech_count = 0
@@ -1156,6 +1238,25 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
             dtype="int16", blocksize=block_size,
         )
         stream.start()
+        if skip_while_tts:
+            # Mic opens NOW, audio is read but DISCARDED while our own TTS is
+            # speaking - eliminates the dead gap where a follow-up command
+            # starting right as Rolex finishes got its first words clipped.
+            t_start_wait = time.time()
+            while not _tts_idle.is_set():
+                if time.time() - t_start_wait > 10:
+                    print("  [!] TTS considered hung - recording anyway")
+                    break
+                try:
+                    stream.read(block_size)
+                except Exception:
+                    break
+                time.sleep(0.01)
+            _last_tts_wait["s"] = time.time() - t_start_wait
+            time.sleep(0.12)          # acoustic tail - don't transcribe our own echo
+        else:
+            _last_tts_wait["s"] = 0.0
+        print("  [*] Listening...")
         for _ in range(max_blocks):
             data, _ = stream.read(block_size)
             mono_i16 = _to_mono(data)          # always int16
@@ -1197,16 +1298,43 @@ def record_audio(max_seconds=MAX_RECORD_SECONDS):
         return None
 
 
+def _resample_aa(audio, sr_in, sr_out=16000):
+    """Resample to sr_out with a proper anti-alias filter.
+
+    Windows mics usually run at 44100/48000 Hz.  Plain "take every Nth
+    sample" folds every frequency above 8kHz back into the speech band
+    (aliasing) and Google STT gets garbled audio - this is why commands
+    can work yet still be misheard.
+    """
+    if sr_in == sr_out:
+        return audio.astype(np.int16)
+    a = audio.astype(np.float32)
+    ratio = sr_in / sr_out
+    # windowed-sinc lowpass with cutoff just below sr_out/2
+    taps = int(24 * ratio) | 1          # odd, ~24 taps per decimation factor
+    taps = max(taps, 33)
+    t = np.arange(taps) - taps // 2
+    fc = (0.9 * (sr_out / 2.0)) / sr_in  # cutoff, cycles/input-sample
+    h = np.sinc(2.0 * fc * t) * np.hamming(taps)
+    h /= h.sum()                         # unity DC gain
+    y = np.convolve(a, h, mode="same")
+    rint = round(ratio)
+    if abs(ratio - rint) < 1e-6 and rint >= 1:
+        y = y[::rint]                    # integer decimation
+    else:                                # non-integer: filter + interpolate
+        n_out = int(len(y) / ratio)
+        idx = np.linspace(0, len(y) - 1, n_out)
+        y = np.interp(idx, np.arange(len(y)), y)
+    return np.clip(y, -32768, 32767).astype(np.int16)
+
+
 def audio_to_wav_bytes(audio):
     # Guarantee int16 mono - a mismatch here silently breaks STT
     audio = np.asarray(audio)
     if audio.dtype != np.int16:
         audio = np.clip(audio.astype(np.float32), -32768, 32767).astype(np.int16)
     if MIC_SAMPLE_RATE != 16000:
-        ratio = 16000 / MIC_SAMPLE_RATE
-        new_len = int(len(audio) * ratio)
-        indices = np.linspace(0, len(audio) - 1, new_len).astype(int)
-        audio = audio[indices]
+        audio = _resample_aa(audio, MIC_SAMPLE_RATE, 16000)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
@@ -1223,6 +1351,7 @@ except ImportError:
     print("  [!] speech_recognition not installed")
 
 _stt_fail_streak = {"n": 0}
+_sphinx_hint_shown = {"done": False}
 
 
 def transcribe(audio):
@@ -1231,62 +1360,78 @@ def transcribe(audio):
         return None
     if audio is None or len(audio) < 1600:
         return None
-    audio = normalize_gain(audio)     # quiet speech -> Google STT hears it
+    audio = normalize_gain(audio)     # quiet speech is audible to STT
     wav = audio_to_wav_bytes(audio)
     rec = _sr_module.Recognizer()
-    rec.pause_threshold = 0.6
-    rec.non_speaking_duration = 0.4
     data = _sr_module.AudioData(wav, 16000, 2)
-    try:
-        text = rec.recognize_google(data, language=STT_LANGUAGE)
-        _stt_fail_streak["n"] = 0
-        return text.lower().strip()
-    except _sr_module.UnknownValueError:
-        print("  [STT] nothing intelligible")
-        return None
-    except _sr_module.RequestError as e:
-        _stt_fail_streak["n"] += 1
-        print(f"  [STT] Google unreachable ({e}) - streak={_stt_fail_streak['n']}")
-        return None
-    except Exception as e:
-        print(f"  [!] Transcription error: {type(e).__name__}: {e}")
-        return None
+
+    engines = []
+    if STT_ENGINE in ("auto", "google"):
+        engines.append("google")
+    if STT_ENGINE in ("auto", "sphinx"):
+        engines.append("sphinx")
+
+    for engine in engines:
+        try:
+            if engine == "google":
+                text = rec.recognize_google(data, language=STT_LANGUAGE)
+            else:
+                text = rec.recognize_sphinx(data)   # 100% offline
+        except _sr_module.UnknownValueError:
+            print(f"  [STT] {engine}: nothing intelligible")
+            continue
+        except _sr_module.RequestError as e:
+            _stt_fail_streak["n"] += 1
+            print(f"  [STT] {engine} unreachable ({e}) - streak={_stt_fail_streak['n']}")
+            continue
+        except Exception as e:
+            if engine == "sphinx":
+                if not _sphinx_hint_shown["done"]:
+                    print("  [!] Offline STT unavailable - install once with:  pip install pocketsphinx")
+                    _sphinx_hint_shown["done"] = True
+            else:
+                print(f"  [!] {engine} error: {type(e).__name__}: {e}")
+            continue
+        text = text.lower().strip()
+        if text:
+            if engine != "google":
+                print(f"  [STT] heard via {engine} (offline)")
+            _stt_fail_streak["n"] = 0
+            return text
+    print(f"  [..] STT gave nothing - tried: {', '.join(engines)}")
+    return None
 
 
 def listen(prompt=None, timeout=MAX_RECORD_SECONDS):
     if prompt:
         speak(prompt)
-    t_tts = time.time()
-    wait_for_tts()          # don't record over our own voice
-    tts_waited = time.time() - t_tts
-    if tts_waited > 0.05:
-        print(f"  [*] Waited {tts_waited:.1f}s for voice to finish before listening")
-    drain_mic()
-    print("  [*] Listening...")
-    t0 = time.time()
-    audio = record_audio(max_seconds=timeout)
+    audio = record_audio(max_seconds=timeout, skip_while_tts=True)
+    if _last_tts_wait["s"] > 0.05:
+        print(f"  [*] Waited {_last_tts_wait['s']:.1f}s for voice to finish before recording")
     if audio is None:
         print("  [..] No speech detected (mic too quiet? see [Mic] line, "
               "raise Windows input volume or move closer)")
         return None
     peak = int(np.abs(audio.astype(np.float32)).max())
     rms = int(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
-    print(f"  [*] Recognizing... ({time.time()-t0:.1f}s audio, peak={peak}, rms={rms})")
+    audio_seconds = len(audio) / MIC_SAMPLE_RATE
+    print(f"  [*] Captured {audio_seconds:.1f}s @ peak={peak} rms={rms} - recognizing...")
     if peak < 250:
         print("  [!] Very low signal - increase mic volume in Windows sound settings")
+    t_stt = time.time()
     text = transcribe(audio)
     if text:
-        print(f"  [Heard] \"{text}\"  ({time.time()-t0:.1f}s total)")
+        print(f"  [Heard] \"{text}\"  (STT {time.time()-t_stt:.1f}s, captured {audio_seconds:.1f}s)")
     else:
-        print(f"  [..] STT returned nothing (Google STT, language={STT_LANGUAGE}, needs internet). "
+        print(f"  [..] STT returned nothing (engines tried: {STT_ENGINE}, language={STT_LANGUAGE}). "
               f"Recorded {len(audio)/MIC_SAMPLE_RATE:.1f}s @ peak={peak} rms={rms}")
         if peak < 800:
             print("  [!] Peak is low even after best-channel selection - raise the Windows mic "
                   "volume/boost, move closer, or close the laptop lid half-way (onboard mic array).")
         else:
-            print("  [!] Voice was loud enough, so Google likely refused it: check internet. "
-                  "If your English accent is not Indian English, change STT_LANGUAGE "
-                  "(currently en-IN) to en-US or en-GB near get_auto_sleep_timeout().")
+            print("  [!] Voice was loud enough, so STT refused it: check internet for Google, "
+                  "or pip install pocketsphinx for offline commands. "
+                  "Wrong accent? Set ROLEX_STT_LANGUAGE=en-US (or en-GB).")
     return text
 
 
@@ -1941,11 +2086,23 @@ try:
 except ImportError:
     _winocr_module = None
     _WINOCR_AVAILABLE = False
-    print("  [!] winocr not installed - screen text reading disabled")
+    print("  [!] winocr not installed - 'click on <text>' disabled.")
+    print("      Fix:  pip install winocr   (needs Windows 10+ and the")
+    print("      English OCR language pack: Settings > Time & Language >")
+    print("      Language > English > Options > add 'Optical character recognition')")
 
 _ocr_cache = {"words": None, "time": 0}
 _ocr_loop = None
 OCR_CACHE_SECONDS = 1.5
+
+
+def _invalidate_ocr():
+    """Screen changed (a click happened) - the cached OCR word list is stale."""
+    try:
+        _ocr_cache["words"] = None
+        _ocr_cache["time"] = 0
+    except Exception:
+        pass
 
 
 def _get_ocr_loop():
@@ -2008,7 +2165,7 @@ def ocr_screen(force=False, screenshot=None):
     if _REDIS_AVAILABLE and words:
         if screen_hash is None:
             screen_hash = _thumb_hash_from_image(screenshot)
-        redis_set(redis_cache_key("ocr", screen_hash), words, ttl=10)
+        redis_set(redis_cache_key("ocr", screen_hash), words, ttl=5)
 
     return words
 
@@ -2019,7 +2176,19 @@ def ocr_screen(force=False, screenshot=None):
 #  never as scattered single-word hits.
 # =============================================================
 def _norm_ocr_text(text):
-    t = re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
+    t = (text or "").lower()
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    toks = t.split()
+    out = []
+    # symmetric OCR-confusion fold, applied to BOTH sides so "save as" still
+    # equals "save as" while "sav e"/"s@ve" also match (OCR lies, often)
+    for tok in toks:
+        tok = (tok.replace("0", "o").replace("1", "l").replace("5", "s")
+                  .replace("8", "b").replace("6", "g").replace("2", "z")
+                  .replace("3", "e").replace("|", "l"))
+        out.append(tok)
+    t = " ".join(out)
+    t = t.replace("rn", "m").replace("vv", "w").replace("cl", "d").replace("ii", "n")
     return " ".join(t.split())
 
 
@@ -2082,6 +2251,37 @@ def find_phrase_on_screen(target, occurrence=1, prefer_region=None, force_ocr=Fa
             matches.append({"x": int((left + right) / 2),
                             "y": int(sum(ys) / len(ys)),
                             "text": ptxt})
+    if not matches:
+        # compact pass: "sav e as" -> "saveas" - tolerates OCR splitting words
+        pcompact = ptxt.replace(" ", "")
+        if pcompact:
+            for line in _cluster_ocr_lines(words):
+                line_compact = ""
+                spans = []   # (start, end, word)
+                for w in line:
+                    nt = _norm_ocr_text(w["text"]).replace(" ", "")
+                    if not nt:
+                        continue
+                    start = len(line_compact)
+                    line_compact += nt
+                    spans.append((start, len(line_compact), w))
+                if not line_compact:
+                    continue
+                idx = 0
+                while True:
+                    pos = line_compact.find(pcompact, idx)
+                    if pos == -1:
+                        break
+                    end_ch = pos + len(pcompact)
+                    hit = [w for (s, e, w) in spans if e > pos and s < end_ch]
+                    if hit:
+                        left = min(w["x"] - w.get("w", 40) / 2 for w in hit)
+                        right = max(w["x"] + w.get("w", 40) / 2 for w in hit)
+                        ys = [w["y"] for w in hit]
+                        matches.append({"x": int((left + right) / 2),
+                                        "y": int(sum(ys) / len(ys)),
+                                        "text": ptxt})
+                    idx = pos + 1
     if not matches:
         # conservative fuzzy: a whole line that is almost exactly the phrase
         for line in _cluster_ocr_lines(words):
@@ -2380,11 +2580,17 @@ def get_foreground_window_info():
 
 
 # STT language: en-IN (Indian English) recognizes the wake word and commands
-# far better for Indian-accented speakers; change to "en-US"/"en-GB" if needed.
-STT_LANGUAGE = "en-IN"
+# far better for Indian-accented speakers; override with ROLEX_STT_LANGUAGE,
+# e.g.  set ROLEX_STT_LANGUAGE=en-US
+STT_LANGUAGE = os.environ.get("ROLEX_STT_LANGUAGE", "en-IN").strip() or "en-IN"
 
 import socket
 socket.setdefaulttimeout(12)  # no network call (incl. Google STT) may hang forever
+
+# Offline voice commands: "auto" = Google, pocketsphinx fallback (100% offline)
+# "google" = Google only, "sphinx" = offline pocketsphinx only.
+# ROLEX_STT_ENGINE env var overrides; needs: pip install pocketsphinx
+STT_ENGINE = os.environ.get("ROLEX_STT_ENGINE", "auto").strip().lower()
 
 
 def get_auto_sleep_timeout():
@@ -4122,16 +4328,52 @@ def grid_click(item_type, col, row=None):
         speak(f"Couldn't identify the {label}.")
 
 
+def _clipboard_set(text):
+    """Set the Windows clipboard to `text` (CF_UNICODETEXT). Unblocks typing
+    of anything pyautogui cannot key in (Hindi, emoji, accents) and makes
+    long text instant."""
+    if sys.platform != "win32":
+        return False
+    try:
+        CF_UNICODETEXT = 13
+        GMEM_MOVEABLE = 0x0002
+        data = (text + "\0").encode("utf-16-le")
+        h = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        p = ctypes.windll.kernel32.GlobalLock(h)
+        ctypes.memmove(p, data, len(data))
+        ctypes.windll.kernel32.GlobalUnlock(h)
+        if not ctypes.windll.user32.OpenClipboard(None):
+            ctypes.windll.kernel32.GlobalFree(h)
+            return False
+        ctypes.windll.user32.EmptyClipboard()
+        ctypes.windll.user32.SetClipboardData(CF_UNICODETEXT, h)
+        ctypes.windll.user32.CloseClipboard()
+        return True
+    except Exception as e:
+        print(f"  [!] Clipboard set failed: {e}")
+        return False
+
+
 def type_text(text):
     speak("Typing")
-    time.sleep(0.3)
+    time.sleep(0.2)
+    non_ascii = any(ord(c) > 0x7F for c in text)
+    if non_ascii or len(text) > 60:
+        if _clipboard_set(text):
+            pyautogui.hotkey("ctrl", "v")
+            print("  [Type] Pasted via clipboard (text pyautogui cannot key in)")
+            return
+        print("  [!] Clipboard unavailable - falling back to keystrokes (chars may drop)")
     try:
-        pyautogui.write(text, interval=0.03)
+        pyautogui.write(text, interval=0.02)
     except Exception:
         try:
-            pyautogui.typewrite(text, interval=0.03)
+            pyautogui.typewrite(text, interval=0.02)
         except Exception as e:
             print(f"  [!] Type error: {e}")
+            if _clipboard_set(text):
+                pyautogui.hotkey("ctrl", "v")
+                print("  [Type] Recovered via clipboard paste")
 
 
 def do_search(query):
@@ -4359,10 +4601,37 @@ def new_tab():
     pyautogui.hotkey("ctrl", "t")
 
 
+# Destructive combos get a spoken confirmation before they run -
+# "press alt f4" / "press shift delete" should never fire by accident.
+_DANGEROUS_COMBOS = {
+    frozenset("alt f4".split()),
+    frozenset("ctrl q".split()),
+    frozenset("ctrl shift q".split()),
+    frozenset("shift delete".split()),
+}
+_CONFIRM_YES = ("yes", "yeah", "yep", "confirm", "do it", "sure", "go ahead", "okay", "ok")
+
+
+def _confirm_destructive(keys):
+    if frozenset(keys) not in _DANGEROUS_COMBOS:
+        return True
+    combo = " + ".join(keys)
+    speak(f"This can close apps or delete things. Press {combo}? Say yes to confirm.")
+    r = listen(timeout=6)
+    ok = bool(r) and any(w in r.lower() for w in _CONFIRM_YES)
+    if not ok:
+        speak("Cancelled.")
+    print(f"  [{'CONFIRM' if ok else 'CANCEL'}] destructive combo: {combo}"
+          + (f" (response: {r!r})" if r else " (no response)"))
+    return ok
+
+
 def press_key(key_name):
     key_name = key_name.strip()
     if "+" in key_name:
         parts = [normalize_key_name(p) for p in key_name.split("+")]
+        if not _confirm_destructive(parts):
+            return
         speak(f"Pressing {'+'.join(parts)}")
         pyautogui.hotkey(*parts)
     else:
@@ -4375,6 +4644,8 @@ def press_key_combo(combo_text):
     keys = parse_key_combo(combo_text)
     if not keys:
         speak("No key recognized")
+        return
+    if len(keys) > 1 and not _confirm_destructive(keys):
         return
     if len(keys) == 1:
         speak(f"Pressing {keys[0]}")
@@ -4398,6 +4669,8 @@ def press_key_repeat(combo_text, times=1):
     keys = parse_key_combo(combo_text)
     if not keys:
         speak("No key recognized")
+        return
+    if not _confirm_destructive(keys):
         return
     combo_name = " + ".join(keys)
     speak(f"Pressing {combo_name} {times} times")
@@ -4562,6 +4835,9 @@ BANNER = r"""
 
    Run  'python rolex_agent.py --selftest'  to see how
    the parser handles your phrasing (no mic needed).
+   Run  'python rolex_agent.py --check'     to verify all installs.
+   Run  'python rolex_agent.py --type "open chrome"'  to run
+   commands typed offline (no mic, no internet).
   ================================================
 """
 
@@ -4812,6 +5088,17 @@ def main():
             return
 
         except Exception as e:
+            ename = type(e).__name__.lower()
+            if "failsafe" in ename:
+                # pyautogui corner-slam aborted this action; it would keep
+                # firing on EVERY mouse action - disable it once, loudly.
+                try:
+                    pyautogui.FAILSAFE = False
+                    print("\n  [!] Mouse slammed to the screen corner (FAILSAFE).")
+                    print("  [!] Mouse-corner abort is now OFF for this session.")
+                    print("  [!] Stop Rolex with Ctrl+C in this console.")
+                except Exception:
+                    pass
             print(f"  [ERROR] {e}")
             import traceback
             traceback.print_exc()
@@ -4858,6 +5145,75 @@ def run_listen_test():
         print("  input device, and that Windows sound input is not muted.")
 
 
+def run_check():
+    """Health probe: which features work on THIS machine, right now."""
+    print("\n  === Rolex health check (offline-safe, no mic needed) ===")
+
+    def probe(label, mod, pip_name=None):
+        try:
+            __import__(mod)
+            print(f"  [  ok  ] {label}")
+            return True
+        except Exception:
+            print(f"  [MISSING] {label:44s} -> pip install {pip_name or mod}")
+            return False
+
+    probe("numpy", "numpy")
+    probe("Pillow (screenshots/OCR)", "PIL", "Pillow")
+    probe("SpeechRecognition", "speech_recognition", "SpeechRecognition")
+    probe("sounddevice (mic)", "sounddevice")
+    probe("pyautogui", "pyautogui")
+    probe("pyttsx3 (SAPI voice)", "pyttsx3")
+    probe("pywin32 (fast SendInput + windows)", "win32api", "pywin32")
+    probe("winocr (click-on-text, English pack)", "winocr")
+    probe("pocketsphinx (OFFLINE voice commands)", "pocketsphinx")
+    probe("requests (Ollama LLM)", "requests")
+    probe("redis (optional cache)", "redis")
+
+    try:
+        import urllib.request
+        urllib.request.urlopen("https://www.google.com", timeout=3)
+        print("  [  ok  ] internet (Google STT / search)")
+    except Exception:
+        print("  [MISSING] internet - Google STT will NOT work.")
+        print("            Offline commands: pip install pocketsphinx,")
+        print("            or type them:  python rolex_agent.py --type \"open chrome\"")
+    print()
+    print("  Offline-capable features (no internet needed):")
+    print("   - every command typed with --type   (parser + executor are local)")
+    print("   - 'click on <text>' via winocr      (local OCR, if installed)")
+    print("   - window min/max/close, mouse, keys, media keys, volume")
+    print("   - wake word matching                (local fuzzy match)")
+    print("   - voice commands via pocketsphinx   (if installed)")
+    print()
+
+
+def run_typed_command(cmd=None):
+    """Run a single typed command (or interactive prompt if none given)."""
+    if cmd:
+        print(f"\n  [Typed] Running: {cmd!r}")
+        intent = parse_command(cmd, use_fallback=False)
+        execute(intent)
+        return
+    print("\n  === Rolex typed-command mode (offline, no mic) ===")
+    print("  Type any command (e.g. 'open chrome', 'move right 200', 'volume up').")
+    print("  Type 'exit' or Ctrl+C to quit.\n")
+    while True:
+        try:
+            line = input("  Rolex> ").strip()
+            if not line:
+                continue
+            if line.lower() in ("exit", "quit", "q"):
+                break
+            intent = parse_command(line, use_fallback=False)
+            execute(intent)
+        except (KeyboardInterrupt, EOFError):
+            print("\n  Exiting typed mode.")
+            break
+        except Exception as e:
+            print(f"  [!] Error: {e}")
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         run_selftest()
@@ -4865,5 +5221,11 @@ if __name__ == "__main__":
         run_waketest()
     elif "--listen" in sys.argv:
         run_listen_test()
+    elif "--check" in sys.argv:
+        run_check()
+    elif "--type" in sys.argv:
+        idx = sys.argv.index("--type")
+        cmd_str = " ".join(sys.argv[idx + 1:]).strip() if idx + 1 < len(sys.argv) else None
+        run_typed_command(cmd_str)
     else:
         main()
